@@ -1,0 +1,26 @@
+{
+  "name": "ema-tracker",
+  "version": "1.0.0",
+  "description": "EMA Crossover Tracker with Brain.js ML",
+  "main": "node.js",
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "axios": "^1.8.4",
+    "brain.js": "^2.0.0-beta.15",
+    "chokidar": "^3.6.0",
+    "colors": "^1.4.0",
+    "csv-writer": "^1.6.0",
+    "figlet": "^1.5.2",
+    "fs": "0.0.1-security",
+    "node-notifier": "^10.0.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "path": "^0.12.7",
+    "ws": "^8.8.1"
+  },
+  "scripts": {
+    "start": "node node.js",
+    "setup": "node setup.js"
+  },
+  "author": "",
+  "license": "ISC"
+}
