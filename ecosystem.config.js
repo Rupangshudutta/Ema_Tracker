@@ -1,23 +1,21 @@
 module.exports = {
   apps: [{
     name: "ema-tracker",
-    script: "node.js",
+    script: "main.js",
+    cwd: __dirname,
     watch: false,
+    // Tokens and secrets come from .env via dotenv — do NOT put them here
     env: {
-      NODE_ENV: "production",
-      EMA_PERIOD: "200",
-      TIMEFRAME: "5m",
-      VOLUME_THRESHOLD: "100000000",
-      CHECK_INTERVAL: "300000",
-      ALERT_COOLDOWN: "900000",
-      TELEGRAM_BOT_TOKEN: "7986381613:AAGPKqQuOb7d1Mb-ARuVwNPi9bS5mX3y_ZQ",
-      TELEGRAM_CHAT_ID: "2066913287"
+      NODE_ENV: "production"
     },
     error_file: "logs/pm2-error.log",
     out_file: "logs/pm2-output.log",
     log_date_format: "YYYY-MM-DD HH:mm:ss",
     max_memory_restart: "200M",
     restart_delay: 3000,
-    autorestart: true
+    autorestart: true,
+    // Restart if it crashes, back off up to 30s between retries
+    exp_backoff_restart_delay: 100,
+    max_restarts: 10
   }]
 };

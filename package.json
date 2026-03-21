@@ -2,14 +2,13 @@
   "name": "ema-tracker",
   "version": "1.0.0",
   "description": "EMA Crossover Tracker with Brain.js ML",
-  "main": "node.js",
+  "main": "main.js",
   "dependencies": {
-    "@tensorflow/tfjs-node": "^4.22.0",
     "axios": "^1.8.4",
-    "brain.js": "^2.0.0-beta.15",
     "chokidar": "^3.6.0",
     "colors": "^1.4.0",
     "csv-writer": "^1.6.0",
+    "dotenv": "^17.3.1",
     "figlet": "^1.5.2",
     "fs": "0.0.1-security",
     "node-notifier": "^10.0.1",
@@ -18,9 +17,11 @@
     "ws": "^8.8.1"
   },
   "scripts": {
-    "start": "node node.js",
-    "setup": "node setup.js"
+    "start": "node main.js",
+    "setup": "node scripts/setup.js",
+    "dev": "node main.js",
+    "pm2": "npx pm2 start ecosystem.config.js"
   },
-  "author": "",
+  "author": "Nana",
   "license": "ISC"
 }

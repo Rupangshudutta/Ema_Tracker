@@ -1,0 +1,29 @@
+# render.yaml — Render.com deployment config
+# Render Background Workers run 24/7 and never sleep (unlike Web Services)
+# Free tier: 750 hours/month — enough for one always-on bot
+
+services:
+  - type: worker                   # "worker" stays running 24/7
+    name: ema-tracker
+    runtime: node
+    buildCommand: npm install
+    startCommand: node main.js
+    autoDeploy: true               # auto-redeploy on git push
+
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false                # set this manually in Render dashboard
+      - key: TELEGRAM_CHAT_ID
+        sync: false                # set this manually in Render dashboard
+      - key: EMA_PERIOD
+        value: "200"
+      - key: TIMEFRAME
+        value: "5m"
+      - key: VOLUME_THRESHOLD
+        value: "100000000"
+      - key: CHECK_INTERVAL
+        value: "300000"
+      - key: ALERT_COOLDOWN
+        value: "900000"
+      - key: NODE_ENV
+        value: "production"

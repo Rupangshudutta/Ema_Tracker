@@ -1,0 +1,25 @@
+# fly.toml — Fly.io deployment config
+# Free tier: 3 shared-cpu-1x VMs, 256 MB RAM each — enough for this bot
+
+app = "ema-tracker"
+primary_region = "sin"            # Singapore — closest to Binance
+
+[build]
+  # Uses the Dockerfile in the root of this repo
+
+[env]
+  NODE_ENV = "production"
+  EMA_PERIOD = "200"
+  TIMEFRAME = "5m"
+  VOLUME_THRESHOLD = "100000000"
+  # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set as secrets:
+  # fly secrets set TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
+
+[[services]]
+  # This is a background worker — no HTTP port needed
+  # Remove this section entirely if you don't need health checks
+
+[mounts]
+  # Persist logs and data across restarts
+  source = "ema_data"
+  destination = "/app/logs"
