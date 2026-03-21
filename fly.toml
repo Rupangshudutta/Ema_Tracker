@@ -1,25 +1,27 @@
 # fly.toml — Fly.io deployment config
-# Free tier: 3 shared-cpu-1x VMs, 256 MB RAM each — enough for this bot
+# Free tier: 3 shared-cpu-1x 256MB VMs — enough for this bot
+# Singapore region = Binance Futures API is NOT geo-blocked here
 
-app = "ema-tracker"
-primary_region = "sin"            # Singapore — closest to Binance
+app = "ema-tracker-bot"
+primary_region = "sin"
 
 [build]
-  # Uses the Dockerfile in the root of this repo
+  # Uses the Dockerfile in the project root
 
 [env]
   NODE_ENV = "production"
   EMA_PERIOD = "200"
   TIMEFRAME = "5m"
   VOLUME_THRESHOLD = "100000000"
-  # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set as secrets:
-  # fly secrets set TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
+  CHECK_INTERVAL = "300000"
+  ALERT_COOLDOWN = "900000"
+  # TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set via:
+  #   fly secrets set TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
 
-[[services]]
-  # This is a background worker — no HTTP port needed
-  # Remove this section entirely if you don't need health checks
+# Background worker — no HTTP port, no load balancer needed
+[processes]
+  app = "node main.js"
 
-[mounts]
-  # Persist logs and data across restarts
-  source = "ema_data"
-  destination = "/app/logs"
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
