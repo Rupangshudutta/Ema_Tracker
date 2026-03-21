@@ -6,6 +6,7 @@ services:
   - type: worker                   # "worker" stays running 24/7
     name: ema-tracker
     runtime: node
+    region: singapore              # Binance Futures API is geo-blocked in US/EU — must use Asia
     buildCommand: npm install
     startCommand: node main.js
     autoDeploy: true               # auto-redeploy on git push
