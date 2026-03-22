@@ -10,8 +10,10 @@ const TelegramBot = require('node-telegram-bot-api');
 const notifier = require('node-notifier');
 const WebSocket = require('ws');
 const { createObjectCsvWriter } = require('csv-writer');
+const http = require('http');
 
 let initialLoadComplete = false;
+let lastCandleTime = null; // Timestamp of the most recently processed closed candle
 // ML configuration
 let ML_ENABLED = false;
 
@@ -35,6 +37,10 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 if (!/^-?[0-9]+$/.test(TELEGRAM_CHAT_ID)) {
     console.error('FATAL: TELEGRAM_CHAT_ID must be a numeric string (digits with optional leading minus).');
+    process.exit(1);
+}
+if (!/^\d+:[A-Za-z0-9_-]{35,}$/.test(TELEGRAM_BOT_TOKEN)) {
+    console.error('FATAL: TELEGRAM_BOT_TOKEN format is invalid. Expected format: <digits>:<35+ alphanumeric chars>');
     process.exit(1);
 }
 
@@ -125,15 +131,17 @@ const ema15Cache = new Map(); // Cache for EMA(15) values (dual mode)
 function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
 const trainingData = new Map(); // Store historical data for ML training
 const modelPerformance = new Map(); // Track ML model accuracy
-const reconnectionAttempts = new Map(); // Track WebSocket reconnection attempts per symbol
+const reconnectionAttempts = new Map(); // Track reconnection attempts (keyed by pool index: "pool_0", "pool_1", …)
 const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
+const WS_TOPICS_PER_CONN = 100;  // Bybit allows ~500 topics/conn; stay well within limits
+const wsPool = [];                // [{ ws, symbols: Set<string>, index }]
 const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsaw
 // Validation constants — shared by settings loader and callback handler
 const VALID_VOLUMES    = [20_000_000, 50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
-let isReconnecting = false; // Prevents stacked reconnections during graceful restarts
+let isReconnecting = false; // Prevents stacked reconnectionsduring graceful restarts
 let monitoringInterval = null; // Reference to the periodic check interval
 
 // Prevent destructive commands from being spammed concurrently.
@@ -197,19 +205,20 @@ let _indicatorsModule = null; // Cached module ref — avoids repeated require()
 const API_RATE_LIMIT = 1200; // 1.2 seconds between API calls
 let lastApiCall = 0;
 
-// Helper function to enforce rate limiting
+// Serialised rate-limit queue — prevents concurrent callers from all reading the
+// same lastApiCall timestamp in the same millisecond, which would bypass the limiter.
+let _rateLimitQueue = Promise.resolve();
 function enforceRateLimit() {
-    const now = Date.now();
-    const timeSinceLastCall = now - lastApiCall;
-
-    if (timeSinceLastCall < API_RATE_LIMIT) {
-        const delay = API_RATE_LIMIT - timeSinceLastCall;
-        lastApiCall = now + delay;
-        return new Promise(resolve => setTimeout(resolve, delay));
-    }
-
-    lastApiCall = now;
-    return Promise.resolve();
+    _rateLimitQueue = _rateLimitQueue.then(() => {
+        const now = Date.now();
+        const wait = API_RATE_LIMIT - (now - lastApiCall);
+        if (wait > 0) {
+            lastApiCall = now + wait;
+            return new Promise(r => setTimeout(r, wait));
+        }
+        lastApiCall = now;
+    });
+    return _rateLimitQueue;
 }
 
 // ML directories
@@ -505,8 +514,8 @@ async function alertNewHighVolumePairs(newPairs) {
 
             log(`New high volume pair alert sent for ${pair.symbol} with volume ${formatVolume(pair.volume)}`, 'success');
 
-            // Setup WebSocket for the new pair
-            setupSymbolWebSocket(pair.symbol);
+            // Subscribe the new pair to the existing pool
+            subscribeSymbolToPool(pair.symbol);
         } catch (error) {
             log(`Error sending new pair alert for ${pair.symbol}: ${error.message}`, 'error');
         }
@@ -653,6 +662,30 @@ function updateDualEMA(key, newClose) {
     return true;
 }
 
+// Fetch Open Interest delta around the crossover candle.
+// Returns { oiNow, oiPrev, deltaPercent } or null on error.
+// Rising OI (>0) = new money entering = stronger signal.
+// Falling OI (<0) = liquidation-driven move = weaker signal.
+async function getOIDelta(symbol) {
+    try {
+        await enforceRateLimit();
+        const response = await axios.get('https://api.bybit.com/v5/market/open-interest', {
+            params: { category: 'linear', symbol, intervalTime: '5min', limit: 2 },
+            timeout: 8000
+        });
+        const list = response.data?.result?.list;
+        if (!list || list.length < 2) return null;
+        const oiNow  = parseFloat(list[0].openInterest);
+        const oiPrev = parseFloat(list[1].openInterest);
+        if (!oiPrev) return null;
+        const deltaPercent = (oiNow - oiPrev) / oiPrev * 100;
+        return { oiNow, oiPrev, deltaPercent };
+    } catch (e) {
+        log(`OI delta fetch failed for ${symbol}: ${e.message}`, 'warning');
+        return null;
+    }
+}
+
 // Send Telegram notification with enhanced formatting
 async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
     try {
@@ -663,10 +696,14 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
 
         // Get 24hr stats for the symbol
         const stats = await get24HrStats(symbol);
+        const oi = await getOIDelta(symbol).catch(() => null);
 
         // Create a TradingView link
         const tradingViewUrl = getTradingViewUrl(symbol);
 
+        const oiLine = oi
+            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
+            : '';
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
             `*Price:* ${formattedPrice}\n` +
@@ -674,6 +711,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             `*Difference:* ${difference.toFixed(2)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+            oiLine +
             `*Timeframe:* ${activeTimeframeLabel()}\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
@@ -731,153 +769,185 @@ function shouldAlert(symbol, currentState, tf = '') {
 }
 
 // WebSocket setup for a symbol
-function setupSymbolWebSocket(symbol) {
-    // Check reconnection attempts
-    const attempts = reconnectionAttempts.get(symbol) || 0;
-    if (attempts >= MAX_RECONNECTION_ATTEMPTS) {
-        log(`Max reconnection attempts reached for ${symbol}. Stopping reconnections.`, 'warning');
-        return null;
-    }
+// ---------------------------------------------------------------------------
+// Pooled WebSocket architecture — a small number of connections (typically
+// 1-3) each subscribe to many symbols, instead of one connection per symbol.
+// This avoids the 80+ simultaneous TCP handshakes that trigger Bybit 403s.
+// ---------------------------------------------------------------------------
 
-    // Close existing connection if any
-    if (activeWebSockets.has(symbol)) {
-        try {
-            activeWebSockets.get(symbol).close();
-        } catch (e) {
-            // Ignore errors when closing
+// Build the subscribe args array for a set of symbols
+function buildSubscribeArgs(symbols) {
+    const args = [];
+    for (const symbol of symbols) {
+        if (DUAL_EMA_MODE) {
+            args.push(`kline.5.${symbol}`, `kline.15.${symbol}`);
+        } else {
+            const bybitInterval = TIMEFRAME
+                .replace('4h', '240')
+                .replace('1h', '60')
+                .replace('m', '');
+            args.push(`kline.${bybitInterval}.${symbol}`);
         }
     }
+    return args;
+}
 
-    // Bybit uses a single connection endpoint — subscribe via JSON message on open
+// Create a single pool connection that subscribes to a chunk of symbols.
+// Returns a poolEntry { ws, symbols, index } stored in wsPool[index].
+function setupPoolConnection(index, symbols) {
+    const poolKey = `pool_${index}`;
     const wsUrl = 'wss://stream.bybit.com/v5/public/linear';
+    let reconnectScheduled = false;
 
     try {
         const ws = new WebSocket(wsUrl);
-        let isConnected = false;
+        const poolEntry = { ws, symbols: new Set(symbols), index };
 
         ws.on('open', () => {
-            isConnected = true;
-            // Reset reconnection attempts on successful connection
-            reconnectionAttempts.set(symbol, 0);
-            log(`WebSocket connected for ${symbol}`, 'success');
-
-            // Subscribe to kline streams for this symbol
-            if (DUAL_EMA_MODE) {
-                ws.send(JSON.stringify({
-                    op: 'subscribe',
-                    args: [`kline.5.${symbol}`, `kline.15.${symbol}`]
-                }));
-            } else {
-                // Convert timeframe string to Bybit interval number: '5m'→'5', '15m'→'15', '1h'→'60', '4h'→'240'
-                const bybitInterval = TIMEFRAME
-                    .replace('4h', '240')
-                    .replace('1h', '60')
-                    .replace('m', '');
-                ws.send(JSON.stringify({
-                    op: 'subscribe',
-                    args: [`kline.${bybitInterval}.${symbol}`]
-                }));
-            }
+            reconnectionAttempts.set(poolKey, 0);
+            reconnectScheduled = false;
+            log(`Pool WS #${index} connected — subscribing ${symbols.length} symbols`, 'success');
+            ws.send(JSON.stringify({ op: 'subscribe', args: buildSubscribeArgs(symbols) }));
         });
 
         ws.on('message', (data) => {
             try {
                 const message = JSON.parse(data);
-
-                // Bybit sends pong, subscription confirmations, etc — ignore them
                 if (!message.topic || !message.topic.startsWith('kline')) return;
 
                 const klineRaw   = message.data[0];
                 const topicParts = message.topic.split('.'); // ['kline','5','BTCUSDT']
-                const intervalStr = topicParts[1];            // '5' or '15'
+                const intervalStr = topicParts[1];
+                const symbol     = topicParts[2];
 
-                // Map Bybit field names to the shape processClosedCandle already expects
                 const kline = {
-                    t: klineRaw.start,    // open time in ms
+                    t: klineRaw.start,
                     o: klineRaw.open,
                     h: klineRaw.high,
                     l: klineRaw.low,
                     c: klineRaw.close,
                     v: klineRaw.volume,
-                    x: klineRaw.confirm   // confirm=true means closed candle
+                    x: klineRaw.confirm
                 };
 
-                // In dual-TF mode derive tf from the topic interval; null for single-mode
                 const tf = DUAL_EMA_MODE
                     ? (intervalStr === '5' ? '5m' : '15m')
                     : null;
 
-                // Only process if the candle is closed
                 if (kline.x === true) {
                     processClosedCandle(symbol, kline, tf);
                 }
             } catch (error) {
-                log(`Error processing WebSocket message for ${symbol}: ${error.message}`, 'error');
+                log(`Error processing pool WS #${index} message: ${error.message}`, 'error');
             }
         });
 
         ws.on('error', (error) => {
-            log(`WebSocket error for ${symbol}: ${error.message}`, 'error');
+            log(`Pool WS #${index} error: ${error.message}`, 'error');
+            if (isReconnecting || reconnectScheduled) return;
+            reconnectScheduled = true;
 
-            // Skip auto-reconnect while a graceful reconnect is running
-            if (isReconnecting) return;
-
-            // Only attempt reconnection if we haven't exceeded max attempts
-            const currentAttempts = reconnectionAttempts.get(symbol) || 0;
-            if (currentAttempts < MAX_RECONNECTION_ATTEMPTS && trackedPairs.has(symbol)) {
-                reconnectionAttempts.set(symbol, currentAttempts + 1);
+            const currentAttempts = reconnectionAttempts.get(poolKey) || 0;
+            if (currentAttempts < MAX_RECONNECTION_ATTEMPTS) {
+                reconnectionAttempts.set(poolKey, currentAttempts + 1);
+                const backoff = Math.min(RECONNECTION_DELAY * Math.pow(2, currentAttempts), 5 * 60 * 1000);
+                log(`Pool WS #${index} reconnecting in ${Math.round(backoff / 1000)}s (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
                 setTimeout(() => {
-                    log(`Reconnecting WebSocket for ${symbol} (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
-                    setupSymbolWebSocket(symbol);
-                }, RECONNECTION_DELAY);
+                    const live = Array.from(poolEntry.symbols).filter(s => trackedPairs.has(s));
+                    if (live.length > 0) wsPool[index] = setupPoolConnection(index, live);
+                }, backoff);
+            } else {
+                log(`Pool WS #${index} max reconnection attempts reached`, 'warning');
             }
         });
 
         ws.on('close', () => {
-            log(`WebSocket closed for ${symbol}`, 'warning');
+            log(`Pool WS #${index} closed`, 'warning');
+            // error handler already scheduled a reconnect — skip
+            if (isReconnecting || reconnectScheduled) return;
+            reconnectScheduled = true;
 
-            // Skip auto-reconnect while a graceful reconnect is running
-            if (isReconnecting) return;
-
-            // Only attempt reconnection if connection was established and we haven't exceeded max attempts
-            if (isConnected && trackedPairs.has(symbol)) {
-                const currentAttempts = reconnectionAttempts.get(symbol) || 0;
-                if (currentAttempts < MAX_RECONNECTION_ATTEMPTS) {
-                    reconnectionAttempts.set(symbol, currentAttempts + 1);
-                    setTimeout(() => {
-                        log(`Reconnecting WebSocket for ${symbol} (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
-                        setupSymbolWebSocket(symbol);
-                    }, RECONNECTION_DELAY);
-                }
+            const currentAttempts = reconnectionAttempts.get(poolKey) || 0;
+            if (currentAttempts < MAX_RECONNECTION_ATTEMPTS) {
+                reconnectionAttempts.set(poolKey, currentAttempts + 1);
+                const backoff = Math.min(RECONNECTION_DELAY * Math.pow(2, currentAttempts), 5 * 60 * 1000);
+                log(`Pool WS #${index} reconnecting in ${Math.round(backoff / 1000)}s (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
+                setTimeout(() => {
+                    const live = Array.from(poolEntry.symbols).filter(s => trackedPairs.has(s));
+                    if (live.length > 0) wsPool[index] = setupPoolConnection(index, live);
+                }, backoff);
             }
         });
 
-        // Store the WebSocket connection
-        activeWebSockets.set(symbol, ws);
+        return poolEntry;
+    } catch (error) {
+        log(`Error creating pool WS #${index}: ${error.message}`, 'error');
+        return null;
+    }
+}
 
-        // Pre-create the ML data dir for this symbol so saveDataPoint never needs
-        // to call existsSync or mkdirSync on the hot candle-close path.
+// Tear down old pool connections and create a fresh pool for all symbols.
+// Historical kline data is fetched once per symbol (not per reconnect).
+function setupPooledWebSockets(allSymbols) {
+    // Close old pool connections
+    for (const entry of wsPool) {
+        if (entry && entry.ws) {
+            try { entry.ws.close(); } catch (e) { /* ignore */ }
+        }
+    }
+    wsPool.length = 0;
+
+    // Pre-create ML dirs & seed historical data for every symbol
+    for (const symbol of allSymbols) {
         if (ML_ENABLED) {
             const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
             fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
         }
-
-        // Initialize with historical data — seed both TFs in dual mode
         if (DUAL_EMA_MODE) {
-            getKlines(symbol, '5m').then(() => log(`5m history loaded for ${symbol}`, 'info')).catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
-            getKlines(symbol, '15m').then(() => log(`15m history loaded for ${symbol}`, 'info')).catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
+            getKlines(symbol, '5m').catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
+            getKlines(symbol, '15m').catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
         } else {
-            getKlines(symbol).then(() => {
-                log(`Historical data loaded for ${symbol}`, 'info');
-            }).catch(error => {
-                log(`Error loading historical data for ${symbol}: ${error.message}`, 'error');
-            });
+            getKlines(symbol).catch(e => log(`Error loading history for ${symbol}: ${e.message}`, 'error'));
         }
+    }
 
-        return ws;
-    } catch (error) {
-        log(`Error setting up WebSocket for ${symbol}: ${error.message}`, 'error');
-        return null;
+    // Chunk symbols into groups and stagger pool connection creation
+    const chunks = [];
+    for (let i = 0; i < allSymbols.length; i += WS_TOPICS_PER_CONN) {
+        chunks.push(allSymbols.slice(i, i + WS_TOPICS_PER_CONN));
+    }
+    chunks.forEach((chunk, idx) => {
+        setTimeout(() => {
+            wsPool[idx] = setupPoolConnection(idx, chunk);
+            log(`Pool WS #${idx} started with ${chunk.length} symbols`, 'info');
+        }, idx * 500);  // 500 ms stagger between pool-level connections
+    });
+}
+
+// Subscribe a single new symbol to an existing pool connection (mid-session discovery).
+function subscribeSymbolToPool(symbol) {
+    if (ML_ENABLED) {
+        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+        fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
+    }
+    if (DUAL_EMA_MODE) {
+        getKlines(symbol, '5m').catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
+        getKlines(symbol, '15m').catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
+    } else {
+        getKlines(symbol).catch(e => log(`Error loading history for ${symbol}: ${e.message}`, 'error'));
+    }
+
+    // Find a pool connection with room
+    const target = wsPool.find(e => e && e.ws.readyState === WebSocket.OPEN && e.symbols.size < WS_TOPICS_PER_CONN);
+    if (target) {
+        target.symbols.add(symbol);
+        target.ws.send(JSON.stringify({ op: 'subscribe', args: buildSubscribeArgs([symbol]) }));
+        log(`Subscribed ${symbol} to pool WS #${target.index}`, 'info');
+    } else {
+        // No room or no open connections — create a new pool entry
+        const newIdx = wsPool.length;
+        wsPool[newIdx] = setupPoolConnection(newIdx, [symbol]);
+        log(`Created new pool WS #${newIdx} for ${symbol}`, 'info');
     }
 }
 
@@ -886,6 +956,7 @@ function setupSymbolWebSocket(symbol) {
 // tf — '5m' or '15m' in dual-TF mode; null in single-mode (uses global TIMEFRAME)
 async function processClosedCandle(symbol, kline, tf = null) {
     try {
+        lastCandleTime = Date.now();
         // Composite key for dual-TF mode so 5m and 15m caches never overwrite each other
         const cacheKey = tf ? tfKey(symbol, tf) : symbol;
 
@@ -1049,7 +1120,7 @@ async function saveDataPoint(symbol, dataPoint) {
         const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.ndjson`;
         const filePath = path.join(symbolDir, filename);
 
-        // Dir is pre-created at WebSocket setup time (setupSymbolWebSocket) but
+        // Dir is pre-created at WebSocket setup time (setupPooledWebSockets) but
         // we create it defensively here in case ML was enabled after initial setup.
         await fs.promises.mkdir(symbolDir, { recursive: true });
         await fs.promises.appendFile(filePath, JSON.stringify(dataPoint) + '\n');
@@ -1245,45 +1316,22 @@ async function updateFuturePriceChange(symbol, timestamp) {
     }
 }
 
-// Update a stored data point in JSON files
+// Update a stored data point — append-only to a tiny labels file.
+// The main NDJSON data file is never read or rewritten, keeping O(1) I/O
+// regardless of how many data points the symbol has accumulated.
 async function updateStoredDataPoint(symbol, timestamp, priceChange) {
     try {
         const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-        // Find the file containing this timestamp
         const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
-        if (!fs.existsSync(symbolDir)) {
-            return false;
-        }
+        if (!fs.existsSync(symbolDir)) return false;
 
-        const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json') || f.endsWith('.ndjson'));
-
-        for (const file of files) {
-            const filePath = path.join(symbolDir, file);
-            const isNdjson = file.endsWith('.ndjson');
-            const raw = await fs.promises.readFile(filePath, 'utf8');
-            const data = isNdjson
-                ? raw.split('\n').filter(Boolean).map(line => JSON.parse(line))
-                : JSON.parse(raw);
-
-            // Find the data point with matching timestamp
-            const index = data.findIndex(d => d.timestamp === timestamp);
-            if (index !== -1) {
-                // Update the future price change
-                data[index].future_price_change = priceChange;
-                data[index].label = priceChange > 1.0 ? 2 : priceChange < -1.0 ? 0 : 1;
-
-                // Save the updated data asynchronously
-                const updated = isNdjson
-                    ? data.map(d => JSON.stringify(d)).join('\n') + '\n'
-                    : JSON.stringify(data, null, 2);
-                fs.writeFile(filePath, updated, (err) => {
-                    if (err) log(`Error writing updated data for ${symbol}: ${err.message}`, 'error');
-                });
-                return true;
-            }
-        }
-
-        return false;
+        const label = priceChange > 1.0 ? 2 : priceChange < -1.0 ? 0 : 1;
+        const labelsPath = path.join(symbolDir, 'labels.ndjson');
+        await fs.promises.appendFile(
+            labelsPath,
+            JSON.stringify({ timestamp, future_price_change: priceChange, label }) + '\n'
+        );
+        return true;
     } catch (error) {
         log(`Error updating stored data point for ${symbol}: ${error.message}`, 'error');
         return false;
@@ -1427,10 +1475,14 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
 
         // Get 24hr stats
         const stats = await get24HrStats(symbol);
+        const oi = await getOIDelta(symbol).catch(() => null);
 
         // TradingView link
         const tradingViewUrl = getTradingViewUrl(symbol);
 
+        const oiLine = oi
+            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
+            : '';
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
             `*Price:* ${formatPrice(price)}\n` +
@@ -1439,6 +1491,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
             `*EMA Spread:* ${spread.toFixed(4)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+            oiLine +
             `*Timeframe:* ${activeTimeframeLabel(tf)}\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
@@ -1574,66 +1627,52 @@ async function updateModelAccuracy(symbol, originalPrice, prediction) {
 async function setupAllWebSockets() {
     try {
         const pairs = await getFuturesPairs();
+        const pairSet = new Set(pairs);
 
-        // Only log to file, not to console
         fs.appendFileSync(
             getDailyLogPath(),
-            `[${new Date().toISOString()}] Setting up WebSockets for ${pairs.length} pairs\n`
+            `[${new Date().toISOString()}] Setting up pooled WebSockets for ${pairs.length} pairs\n`
         );
 
-        // Close any existing WebSockets for pairs that are no longer tracked
-        for (const [symbol, ws] of activeWebSockets.entries()) {
-            if (!pairs.includes(symbol)) {
-                // Only log to file, not to console
+        // Clean caches for symbols that dropped out of the active pair list
+        for (const symbol of Array.from(trackedPairs)) {
+            if (!pairSet.has(symbol)) {
                 fs.appendFileSync(
                     getDailyLogPath(),
-                    `[${new Date().toISOString()}] Closing WebSocket for ${symbol} (no longer tracked)\n`
+                    `[${new Date().toISOString()}] Cleaning caches for ${symbol} (no longer tracked)\n`
                 );
-                try {
-                    ws.close();
-                } catch (e) {
-                    // Ignore errors when closing
+                trackedPairs.delete(symbol);
+
+                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
+                csvWriterCache.delete(csvPath);
+
+                for (const key of [symbol, `${symbol}_5m`, `${symbol}_15m`]) {
+                    klineCache.delete(key);
+                    emaCache.delete(key);
+                    ema9Cache.delete(key);
+                    ema15Cache.delete(key);
                 }
-                activeWebSockets.delete(symbol);
-                trackedPairs.delete(symbol);
-
-                // Evict stale per-symbol CSV writer to avoid unbounded cache growth.
-                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
-                csvWriterCache.delete(csvPath);
+                for (const key of [...coinStates.keys()].filter(k => k === symbol || k.startsWith(`${symbol}_`))) {
+                    coinStates.delete(key);
+                }
+                for (const key of [...lastAlerts.keys()].filter(k => k === symbol || k.startsWith(`${symbol}_`))) {
+                    lastAlerts.delete(key);
+                }
             }
         }
 
-        // Also prune stale tracked symbols that no longer have active sockets.
-        for (const symbol of Array.from(trackedPairs)) {
-            if (!pairs.includes(symbol)) {
-                trackedPairs.delete(symbol);
-                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
-                csvWriterCache.delete(csvPath);
-            }
-        }
+        // Close old pool connections and recreate with the current pair list
+        setupPooledWebSockets(pairs);
 
-        // Setup WebSockets for all tracked pairs
-        for (const symbol of pairs) {
-            if (!activeWebSockets.has(symbol) || activeWebSockets.get(symbol).readyState !== WebSocket.OPEN) {
-                setupSymbolWebSocket(symbol);
-
-                // Add a small delay to avoid rate limiting
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-        }
-
-        // Only log to file, not to console
         fs.appendFileSync(
             getDailyLogPath(),
-            `[${new Date().toISOString()}] WebSocket setup completed for ${pairs.length} pairs\n`
+            `[${new Date().toISOString()}] Pooled WebSocket setup completed — ${pairs.length} symbols across ${Math.ceil(pairs.length / WS_TOPICS_PER_CONN)} connection(s)\n`
         );
     } catch (error) {
-        // Only log to file, not to console
         fs.appendFileSync(
             getDailyLogPath(),
-            `[${new Date().toISOString()}] Error setting up WebSockets: ${error.message}\n`
+            `[${new Date().toISOString()}] Error setting up pooled WebSockets: ${error.message}\n`
         );
     }
 }
@@ -1758,27 +1797,9 @@ async function checkEMACross() {
 // Save training data to disk (both JSON and CSV)
 function saveTrainingData() {
     try {
-        log('Saving training data...', 'info');
-
-        // Save each symbol's data
-        for (const [symbol, data] of trainingData.entries()) {
-            // Save to JSON
-            const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-            const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
-            if (!fs.existsSync(symbolDir)) {
-                fs.mkdirSync(symbolDir, { recursive: true });
-            }
-
-            // Use current month for filename
-            const date = new Date();
-            const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.json`;
-            const filePath = path.join(symbolDir, filename);
-
-            fs.writeFile(filePath, JSON.stringify(data, null, 2), (err) => {
-                if (err) log(`Error writing training data for ${symbol}: ${err.message}`, 'error');
-            });
-
-            // Export to CSV
+        // NDJSON files are the append-only source of truth — no full JSON rewrite needed.
+        // Just refresh CSV snapshots and persist model performance metadata.
+        for (const symbol of trainingData.keys()) {
             exportToCSV(symbol);
         }
 
@@ -1834,6 +1855,28 @@ function loadTrainingData() {
             }
 
             if (symbolData.length > 0) {
+                // Apply persisted labels (future_price_change) written by the deferred queue.
+                // Last label entry per timestamp wins (handles multiple updates to same point).
+                const labelsPath = path.join(symbolDir, 'labels.ndjson');
+                if (fs.existsSync(labelsPath)) {
+                    try {
+                        const lblMap = new Map(
+                            fs.readFileSync(labelsPath, 'utf8')
+                                .split('\n').filter(Boolean)
+                                .map(l => JSON.parse(l))
+                                .map(l => [l.timestamp, l])
+                        );
+                        for (const d of symbolData) {
+                            const lbl = lblMap.get(d.timestamp);
+                            if (lbl) {
+                                d.future_price_change = lbl.future_price_change;
+                                d.label = lbl.label;
+                            }
+                        }
+                    } catch (e) {
+                        log(`Error loading labels for ${symbol}: ${e.message}`, 'warning');
+                    }
+                }
                 trainingData.set(symbol, symbolData);
                 log(`Loaded ${symbolData.length} data points for ${symbol}`, 'info');
             }
@@ -1965,6 +2008,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
 
         // Get 24hr stats for the symbol
         const stats = await get24HrStats(symbol);
+        const oi = await getOIDelta(symbol).catch(() => null);
 
         // Format ML prediction with confidence emoji
         let confidenceEmoji = '⚠️'; // Neutral/uncertain
@@ -1977,6 +2021,9 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
         // Create a TradingView link
         const tradingViewUrl = getTradingViewUrl(symbol);
 
+        const oiLine = oi
+            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '📈 new money (stronger)' : oi.deltaPercent <= -0.5 ? '📉 liquidation (weaker)' : '→ neutral'}\n`
+            : '';
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
             `*Price:* ${formattedPrice}\n` +
@@ -1984,6 +2031,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `*Difference:* ${difference.toFixed(2)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+            oiLine +
             `*Timeframe:* ${activeTimeframeLabel()}\n` +
             `*ML Prediction:* ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
@@ -2174,11 +2222,11 @@ async function refreshWebSockets(chatId) {
         log('Graceful reconnect started — closing all WebSocket streams...', 'info');
         if (chatId) await bot.sendMessage(chatId, '⏳ *Disconnecting all WebSocket streams...*', { parse_mode: 'Markdown' }).catch(() => {});
 
-        // Terminate every active connection
-        for (const [, ws] of activeWebSockets.entries()) {
-            try { ws.close(); } catch (e) { /* ignore */ }
+        // Terminate every pool connection
+        for (const entry of wsPool) {
+            if (entry && entry.ws) { try { entry.ws.close(); } catch (e) { /* ignore */ } }
         }
-        activeWebSockets.clear();
+        wsPool.length = 0;
         reconnectionAttempts.clear();
 
         log('All WebSockets closed. Waiting 10 s before reconnecting...', 'info');
@@ -2417,8 +2465,7 @@ async function sendMainMenu(chatId) {
 async function sendStatusUpdate(chatId) {
     try {
         const pairs = await getFuturesPairs();
-        const activeWsCount = Array.from(activeWebSockets.values())
-            .filter(ws => ws.readyState === WebSocket.OPEN).length;
+        const activeWsCount = wsPool.filter(e => e && e.ws && e.ws.readyState === WebSocket.OPEN).length;
 
         const message = `*EMA Tracker Status*\n\n` +
             `*Active Configuration:*\n` +
@@ -2680,59 +2727,57 @@ async function sendStartupMessage() {
     }
 }
 
-// WebSocket heartbeat function to keep connections alive
+// WebSocket heartbeat function — operates on the pool instead of per-symbol connections
 function startWebSocketHeartbeat() {
-    // Check WebSocket connections every minute
+    // Check pool connections every minute
     setInterval(() => {
-        // Don't interfere while a graceful reconnect is in progress
         if (isReconnecting) return;
         try {
             let reconnected = 0;
-
-            for (const [symbol, ws] of activeWebSockets.entries()) {
-                // If WebSocket is closed or closing, reconnect
-                if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-                    // Only log to file, not to console
+            for (let i = 0; i < wsPool.length; i++) {
+                const entry = wsPool[i];
+                if (!entry || !entry.ws) continue;
+                if (entry.ws.readyState === WebSocket.CLOSED || entry.ws.readyState === WebSocket.CLOSING) {
                     fs.appendFileSync(
                         getDailyLogPath(),
-                        `[${new Date().toISOString()}] WebSocket for ${symbol} is closed or closing. Reconnecting...\n`
+                        `[${new Date().toISOString()}] Pool WS #${i} is dead. Reconnecting ${entry.symbols.size} symbols...\n`
                     );
-                    setupSymbolWebSocket(symbol);
-                    reconnected++;
+                    const live = Array.from(entry.symbols).filter(s => trackedPairs.has(s));
+                    if (live.length > 0) {
+                        reconnectionAttempts.set(`pool_${i}`, 0);
+                        wsPool[i] = setupPoolConnection(i, live);
+                        reconnected++;
+                    }
                 }
             }
-
             if (reconnected > 0) {
-                // Only log to file, not to console
                 fs.appendFileSync(
                     getDailyLogPath(),
-                    `[${new Date().toISOString()}] Reconnected ${reconnected} WebSocket connections during heartbeat check\n`
+                    `[${new Date().toISOString()}] Reconnected ${reconnected} pool connection(s) during heartbeat\n`
                 );
             }
         } catch (error) {
-            // Only log to file, not to console
             fs.appendFileSync(
                 getDailyLogPath(),
                 `[${new Date().toISOString()}] Error in WebSocket heartbeat: ${error.message}\n`
             );
         }
-    }, 60000); // Check every minute
+    }, 60000);
 
-    // TCP-level ping every 3 minutes keeps every connection alive and detects dead
-    // connections sooner than waiting for readyState to flip.
+    // TCP-level ping every 3 minutes
     setInterval(() => {
-        for (const [symbol, ws] of activeWebSockets.entries()) {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.ping();
+        for (const entry of wsPool) {
+            if (entry && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+                entry.ws.ping();
             }
         }
     }, 3 * 60 * 1000);
 
-    // Bybit requires an application-level JSON ping every 20 seconds or it drops the connection
+    // Bybit requires an application-level JSON ping every 20 seconds
     setInterval(() => {
-        for (const [symbol, ws] of activeWebSockets.entries()) {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ op: 'ping' }));
+        for (const entry of wsPool) {
+            if (entry && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+                entry.ws.send(JSON.stringify({ op: 'ping' }));
             }
         }
     }, 20 * 1000);
@@ -2845,15 +2890,18 @@ bot.on('callback_query', handleCallbackQuery);
 async function gracefulShutdown(signal) {
     try {
         log(`Received ${signal}. Shutting down gracefully...`, 'warning');
-        // Close all WebSocket connections
-        for (const [symbol, ws] of activeWebSockets.entries()) {
+        // Close all pool WebSocket connections
+        for (const entry of wsPool) {
+            if (entry && entry.ws) {
                 try {
-                    ws.close();
-                    log(`Closed WebSocket for ${symbol}`, 'info');
+                    entry.ws.close();
+                    log(`Closed pool WS #${entry.index} (${entry.symbols.size} symbols)`, 'info');
                 } catch (e) {
                     // Ignore errors when closing
                 }
             }
+        }
+        wsPool.length = 0;
 
         // Flush alert state so cooldowns and coin states survive the restart
         saveAlertState();
@@ -2950,12 +2998,35 @@ function rotateLogs() {
     }
 }
 
+// Tiny HTTP health endpoint for external monitoring (UptimeRobot, cron jobs, etc.).
+// Returns 200 + JSON status blob on GET /health.
+// Configure port via HEALTH_PORT env var (default: 3000).
+function startHealthServer() {
+    const port = parseInt(process.env.HEALTH_PORT, 10) || 3000;
+    const server = http.createServer((req, res) => {
+        if (req.url !== '/health') { res.writeHead(404); res.end(); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            uptime: Math.floor(process.uptime()),
+            activePoolConnections: wsPool.filter(e => e && e.ws && e.ws.readyState === WebSocket.OPEN).length,
+            totalPoolConnections: wsPool.length,
+            trackedPairs: trackedPairs.size,
+            lastCandleTime,
+            initialLoadComplete
+        }));
+    });
+    server.listen(port, () => log(`Health endpoint listening on port ${port}`, 'info'));
+    server.on('error', e => log(`Health server error: ${e.message}`, 'warning'));
+}
+
 // Initialize the terminal and start monitoring
 async function initialize() {
     try {
         // Initialize terminal and load settings
         initializeTerminal();
         loadSettings();
+        startHealthServer();
         loadAlertState(); // restore last-alert timestamps so restarts don't re-fire crossovers
         rotateLogs();
 
@@ -3003,13 +3074,19 @@ async function initialize() {
         // Start WebSocket heartbeat
         startWebSocketHeartbeat();
 
-        // Periodically reset reconnection counters for maxed-out symbols and re-attempt
+        // Periodically reset reconnection counters for maxed-out pool connections
         setInterval(() => {
-            for (const [symbol, attempts] of reconnectionAttempts.entries()) {
-                if (attempts >= MAX_RECONNECTION_ATTEMPTS && trackedPairs.has(symbol) && !activeWebSockets.has(symbol)) {
-                    log(`Resetting reconnection counter for ${symbol} and re-attempting...`, 'info');
-                    reconnectionAttempts.set(symbol, 0);
-                    setupSymbolWebSocket(symbol);
+            for (let i = 0; i < wsPool.length; i++) {
+                const poolKey = `pool_${i}`;
+                const attempts = reconnectionAttempts.get(poolKey) || 0;
+                const entry = wsPool[i];
+                if (attempts >= MAX_RECONNECTION_ATTEMPTS && entry) {
+                    const live = Array.from(entry.symbols).filter(s => trackedPairs.has(s));
+                    if (live.length > 0 && entry.ws.readyState !== WebSocket.OPEN) {
+                        log(`Resetting reconnection counter for pool WS #${i} and re-attempting (${live.length} symbols)...`, 'info');
+                        reconnectionAttempts.set(poolKey, 0);
+                        wsPool[i] = setupPoolConnection(i, live);
+                    }
                 }
             }
         }, 5 * 60 * 1000); // every 5 minutes
