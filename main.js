@@ -107,6 +107,8 @@ const klineCache = new Map(); // Cache for kline data
 const emaCache = new Map(); // Cache for calculated EMAs
 const ema9Cache = new Map(); // Cache for EMA(9) values (dual mode)
 const ema15Cache = new Map(); // Cache for EMA(15) values (dual mode)
+// Composite cache key for dual-TF mode — "BTCUSDT_5m" / "BTCUSDT_15m"
+function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
 const trainingData = new Map(); // Store historical data for ML training
 const modelPerformance = new Map(); // Track ML model accuracy
 const reconnectionAttempts = new Map(); // Track WebSocket reconnection attempts per symbol
@@ -145,6 +147,12 @@ async function safeSendAlert(chatId, text, opts) {
 function getTradingViewUrl(symbol) {
     const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
     return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USDT.P`;
+}
+// Returns a human-readable timeframe label for the current mode.
+// Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
+function activeTimeframeLabel(tf = '') {
+    if (DUAL_EMA_MODE) return tf ? tf.toUpperCase() : '5m + 15m';
+    return TIMEFRAME;
 }
 let _indicatorsModule = null; // Cached module ref — avoids repeated require() on every closed candle
 // Rate limiting for API calls
@@ -327,7 +335,7 @@ function initializeTerminal() {
     console.clear();
     console.log(figlet.textSync('EMA Tracker', { font: 'Standard' }).green);
     console.log('Monitoring Binance Futures for EMA Crossovers'.yellow.bold);
-    console.log(`Configuration: ${DUAL_EMA_MODE ? 'EMA 9/15 Cross' : EMA_PERIOD + ' EMA'} | ${TIMEFRAME} Timeframe | Volume > ${VOLUME_THRESHOLD.toLocaleString()}`.cyan);
+    console.log(`Configuration: ${DUAL_EMA_MODE ? 'EMA 9/15 Cross [5m+15m]' : EMA_PERIOD + ' EMA'} | ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME} Timeframe | Volume > ${VOLUME_THRESHOLD.toLocaleString()}`.cyan);
     console.log(`Alert Cooldown: ${ALERT_COOLDOWN / 60000} minutes`.magenta);
     console.log(`Telegram Alerts: Enabled for Chat ID ${TELEGRAM_CHAT_ID}`.blue);
     console.log(`WebSocket Real-Time Monitoring: Enabled`.green);
@@ -335,7 +343,7 @@ function initializeTerminal() {
     console.log('='.repeat(80).dim);
     console.log('\nCROSSOVER EVENTS:'.cyan.bold);
 
-    log(`EMA Tracker started with configuration: Mode=${DUAL_EMA_MODE ? 'EMA9/15' : 'EMA' + EMA_PERIOD}, Timeframe=${TIMEFRAME}, Volume Threshold=${VOLUME_THRESHOLD}, ML=${ML_ENABLED}`);
+    log(`EMA Tracker started with configuration: Mode=${DUAL_EMA_MODE ? 'EMA9/15[5m+15m]' : 'EMA' + EMA_PERIOD}, Timeframe=${DUAL_EMA_MODE ? '5m+15m' : TIMEFRAME}, Volume Threshold=${VOLUME_THRESHOLD}, ML=${ML_ENABLED}`);
 }
 
 // Helper function to format volume
@@ -462,14 +470,16 @@ async function alertNewHighVolumePairs(newPairs) {
 }
 
 // Retrieve historical candlestick data for the given symbol
-async function getKlines(symbol) {
+// tf — optional timeframe override (e.g. '5m', '15m'); defaults to TIMEFRAME
+async function getKlines(symbol, tf = null) {
     try {
+        const interval = tf || TIMEFRAME;
         // Request enough candles for the active EMA period
         const requiredPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
         const limit = requiredPeriod + 100;
 
         const response = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
-            params: { symbol, interval: TIMEFRAME, limit: limit },
+            params: { symbol, interval, limit },
             timeout: 10000
         });
 
@@ -482,8 +492,11 @@ async function getKlines(symbol) {
             volume: parseFloat(k[5])
         }));
 
+        // Use composite key when tf is explicitly provided (dual-TF mode)
+        const cacheKey = tf ? tfKey(symbol, tf) : symbol;
+
         // Update the kline cache
-        klineCache.set(symbol, klines);
+        klineCache.set(cacheKey, klines);
 
         // Calculate and cache EMA based on current mode
         const closes = klines.map(k => k.close);
@@ -492,17 +505,17 @@ async function getKlines(symbol) {
             // Dual EMA mode: calculate EMA(9) and EMA(15)
             const ema9Values = calculateEMA(closes, 9);
             const ema15Values = calculateEMA(closes, 15);
-            ema9Cache.set(symbol, ema9Values);
-            ema15Cache.set(symbol, ema15Values);
+            ema9Cache.set(cacheKey, ema9Values);
+            ema15Cache.set(cacheKey, ema15Values);
         } else {
             // Single EMA mode: calculate one EMA for the configured period
             const emaValues = calculateEMA(closes, EMA_PERIOD);
-            emaCache.set(symbol, emaValues);
+            emaCache.set(cacheKey, emaValues);
         }
 
         const minPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
         if (klines.length < minPeriod) {
-            log(`Warning: Not enough candles for ${symbol}. Needed ${minPeriod}, got ${klines.length}`, 'warning');
+            log(`Warning: Not enough candles for ${symbol} [${interval}]. Needed ${minPeriod}, got ${klines.length}`, 'warning');
         }
 
         return klines;
@@ -565,6 +578,27 @@ function updateEMA(symbol, newPrice) {
     return true;
 }
 
+// Incremental O(1) dual EMA update — appends one new EMA(9) and EMA(15) value
+// key — tfKey(symbol, tf) in dual mode, or symbol in single mode
+function updateDualEMA(key, newClose) {
+    const e9  = ema9Cache.get(key);
+    const e15 = ema15Cache.get(key);
+    if (!e9?.length || !e15?.length) return false;
+
+    const k9  = 2 / (9  + 1);
+    const k15 = 2 / (15 + 1);
+    e9.push((newClose - e9.at(-1)) * k9  + e9.at(-1));
+    e15.push((newClose - e15.at(-1)) * k15 + e15.at(-1));
+
+    // Keep arrays bounded (max 200 entries is plenty for EMA9/15)
+    if (e9.length  > 200) e9.splice(0, e9.length - 200);
+    if (e15.length > 200) e15.splice(0, e15.length - 200);
+
+    ema9Cache.set(key, e9);
+    ema15Cache.set(key, e15);
+    return true;
+}
+
 // Send Telegram notification with enhanced formatting
 async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
     try {
@@ -586,7 +620,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             `*Difference:* ${difference.toFixed(2)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
-            `*Timeframe:* ${TIMEFRAME}\n\n` +
+            `*Timeframe:* ${activeTimeframeLabel()}\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
 
@@ -620,20 +654,24 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
 }
 
 // Check if we should alert for this symbol based on direction change and cooldown
-function shouldAlert(symbol, currentState) {
+// tf — '5m' or '15m' in dual-TF mode; '' for single-mode (uses old key format)
+function shouldAlert(symbol, currentState, tf = '') {
     const now = Date.now();
-    const previousState = coinStates.get(symbol);
-    // Per-direction key so bullish and bearish each have their own cooldown window
-    const alertKey = `${symbol}_${currentState}`;
-    const lastAlertTime = lastAlerts.get(alertKey) || 0;
+    // 4 independent cooldown buckets per symbol in dual-TF mode:
+    //   BTCUSDT_5m_ema9_above  /  BTCUSDT_5m_ema9_below
+    //   BTCUSDT_15m_ema9_above /  BTCUSDT_15m_ema9_below
+    const stateKey = tf ? tfKey(symbol, tf) : symbol;
+    const alertKey = tf ? `${symbol}_${tf}_${currentState}` : `${symbol}_${currentState}`;
+    const previousState   = coinStates.get(stateKey);
+    const lastAlertTime   = lastAlerts.get(alertKey) || 0;
 
     if (previousState !== currentState && now - lastAlertTime >= ALERT_COOLDOWN) {
-        coinStates.set(symbol, currentState);
+        coinStates.set(stateKey, currentState);
         lastAlerts.set(alertKey, now);
         saveAlertState();
         return true;
     } else if (previousState !== currentState) {
-        log(`Alert for ${symbol} (${currentState}) skipped due to cooldown.`, 'warning');
+        log(`Alert for ${symbol}${tf ? ` [${tf.toUpperCase()}]` : ''} (${currentState}) skipped due to cooldown.`, 'warning');
     }
     return false;
 }
@@ -656,9 +694,12 @@ function setupSymbolWebSocket(symbol) {
         }
     }
 
-    // Create WebSocket URL based on timeframe
+    // Create WebSocket URL based on mode
+    // Dual-TF mode: one multiplexed connection handles both 5m and 15m — zero extra connections
     const wsSymbol = symbol.toLowerCase();
-    const wsUrl = `wss://fstream.binance.com/ws/${wsSymbol}@kline_${TIMEFRAME}`;
+    const wsUrl = DUAL_EMA_MODE
+        ? `wss://fstream.binance.com/stream?streams=${wsSymbol}@kline_5m/${wsSymbol}@kline_15m`
+        : `wss://fstream.binance.com/ws/${wsSymbol}@kline_${TIMEFRAME}`;
 
     try {
         const ws = new WebSocket(wsUrl);
@@ -675,14 +716,17 @@ function setupSymbolWebSocket(symbol) {
             try {
                 const message = JSON.parse(data);
 
-                // Process kline data
-                if (message.e === 'kline') {
-                    const kline = message.k;
+                // Multiplexed streams wrap payload in { stream, data }; single streams don't
+                const payload = message.data || message;
+                if (payload.e !== 'kline') return;
 
-                    // Only process if the candle is closed
-                    if (kline.x === true) {
-                        processClosedCandle(symbol, kline);
-                    }
+                const kline = payload.k;
+                // In dual-TF mode pass the actual interval ('5m'/'15m'); null for single-mode
+                const tf = DUAL_EMA_MODE ? kline.i : null;
+
+                // Only process if the candle is closed
+                if (kline.x === true) {
+                    processClosedCandle(symbol, kline, tf);
                 }
             } catch (error) {
                 log(`Error processing WebSocket message for ${symbol}: ${error.message}`, 'error');
@@ -728,12 +772,17 @@ function setupSymbolWebSocket(symbol) {
         // Store the WebSocket connection
         activeWebSockets.set(symbol, ws);
 
-        // Initialize with historical data
-        getKlines(symbol).then(() => {
-            log(`Historical data loaded for ${symbol}`, 'info');
-        }).catch(error => {
-            log(`Error loading historical data for ${symbol}: ${error.message}`, 'error');
-        });
+        // Initialize with historical data — seed both TFs in dual mode
+        if (DUAL_EMA_MODE) {
+            getKlines(symbol, '5m').then(() => log(`5m history loaded for ${symbol}`, 'info')).catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
+            getKlines(symbol, '15m').then(() => log(`15m history loaded for ${symbol}`, 'info')).catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
+        } else {
+            getKlines(symbol).then(() => {
+                log(`Historical data loaded for ${symbol}`, 'info');
+            }).catch(error => {
+                log(`Error loading historical data for ${symbol}: ${error.message}`, 'error');
+            });
+        }
 
         return ws;
     } catch (error) {
@@ -744,10 +793,14 @@ function setupSymbolWebSocket(symbol) {
 
 
 // Process a closed candle from WebSocket with improved ML data collection
-async function processClosedCandle(symbol, kline) {
+// tf — '5m' or '15m' in dual-TF mode; null in single-mode (uses global TIMEFRAME)
+async function processClosedCandle(symbol, kline, tf = null) {
     try {
+        // Composite key for dual-TF mode so 5m and 15m caches never overwrite each other
+        const cacheKey = tf ? tfKey(symbol, tf) : symbol;
+
         // Get cached klines or initialize if not exists
-        let klines = klineCache.get(symbol) || [];
+        let klines = klineCache.get(cacheKey) || [];
 
         // Create new kline object
         const newKline = {
@@ -768,7 +821,7 @@ async function processClosedCandle(symbol, kline) {
             klines = klines.slice(-maxCacheSize);
         }
 
-        klineCache.set(symbol, klines);
+        klineCache.set(cacheKey, klines);
 
         // Get closes for EMA calculation
         const closes = klines.map(k => k.close);
@@ -776,25 +829,29 @@ async function processClosedCandle(symbol, kline) {
 
         // Calculate EMA values based on current mode
         if (DUAL_EMA_MODE) {
-            // Dual EMA mode: calculate EMA(9) and EMA(15)
-            const ema9Values = calculateEMA(closes, 9);
-            const ema15Values = calculateEMA(closes, 15);
-            ema9Cache.set(symbol, ema9Values);
-            ema15Cache.set(symbol, ema15Values);
+            // Incremental O(1) dual EMA update — fall back to full recalc on first candle
+            const updated = updateDualEMA(cacheKey, newKline.close);
+            if (!updated) {
+                ema9Cache.set(cacheKey, calculateEMA(closes, 9));
+                ema15Cache.set(cacheKey, calculateEMA(closes, 15));
+            }
+
+            const e9 = ema9Cache.get(cacheKey) || [];
+            const e15 = ema15Cache.get(cacheKey) || [];
 
             // Check for dual EMA crossover (EMA9 vs EMA15)
-            if (ema9Values.length >= 2 && ema15Values.length >= 2) {
-                // Align arrays: EMA(9) starts 6 candles earlier than EMA(15), so trim the longer array
-                const offset = ema9Values.length - ema15Values.length;
-                const alignedEma9 = offset > 0 ? ema9Values.slice(offset) : ema9Values;
-                const alignedEma15 = offset < 0 ? ema15Values.slice(-offset) : ema15Values;
+            if (e9.length >= 2 && e15.length >= 2) {
+                // Align arrays — EMA(9) accumulates 6 more entries than EMA(15)
+                const offset = e9.length - e15.length;
+                const a9  = offset > 0 ? e9.slice(offset)  : e9;
+                const a15 = offset < 0 ? e15.slice(-offset) : e15;
 
-                const lastEma9 = alignedEma9[alignedEma9.length - 1];
-                const prevEma9 = alignedEma9[alignedEma9.length - 2];
-                const lastEma15 = alignedEma15[alignedEma15.length - 1];
-                const prevEma15 = alignedEma15[alignedEma15.length - 2];
-
-                checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, lastEma15, closes[closes.length - 1]);
+                checkForDualEmaCrossover(
+                    symbol,
+                    a9.at(-2), a9.at(-1),
+                    a15.at(-2), a15.at(-1),
+                    closes.at(-1), tf
+                );
             }
         } else {
             // Single EMA mode — update incrementally if cached, fall back to full recalc on first candle
@@ -867,8 +924,10 @@ async function processClosedCandle(symbol, kline) {
                 trainingData.set(symbol, trainingData.get(symbol).slice(-1000));
             }
 
-            // Save to JSON file
-            saveDataPoint(symbol, dataPoint);
+            // Fire-and-forget: don't block the candle loop, but surface disk errors
+            saveDataPoint(symbol, dataPoint).catch(e =>
+                log(`saveDataPoint failed for ${symbol}: ${e.message}`, 'error')
+            );
 
             // Export to CSV periodically
             if (trainingData.get(symbol).length % 10 === 0) {
@@ -878,6 +937,8 @@ async function processClosedCandle(symbol, kline) {
             // Schedule update of future price change (after 24 hours)
             deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, kline.t) });
             deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
+            // Safety cap — oldest entries are stale beyond 24 h; discard if queue grows unexpectedly
+            if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
         }
     } catch (error) {
         log(`Error processing closed candle for ${symbol}: ${error.message}`, 'error');
@@ -1014,67 +1075,68 @@ function exportAllDataToCSV() {
     }
 }
 
-// Process real-time candle updates
-function processRealtimeCandle(symbol, kline, logUnconfirmed = true) {
-    try {
-        // Get cached klines
-        const klines = klineCache.get(symbol);
-        if (!klines || klines.length === 0) {
-            return; // No historical data yet
-        }
 
-        // Get current price
-        const currentPrice = parseFloat(kline.c);
+// // Process real-time candle updates
+// function processRealtimeCandle(symbol, kline, logUnconfirmed = true) {
+//     try {
+//         // Get cached klines
+//         const klines = klineCache.get(symbol);
+//         if (!klines || klines.length === 0) {
+//             return; // No historical data yet
+//         }
 
-        // Get cached EMA values
-        const emaValues = emaCache.get(symbol);
-        if (!emaValues || emaValues.length < 2) {
-            return; // Not enough EMA values yet
-        }
+//         // Get current price
+//         const currentPrice = parseFloat(kline.c);
 
-        // Get the last closed price and EMA
-        const lastClosedPrice = klines[klines.length - 1].close;
-        const lastEMA = emaValues[emaValues.length - 1];
+//         // Get cached EMA values
+//         const emaValues = emaCache.get(symbol);
+//         if (!emaValues || emaValues.length < 2) {
+//             return; // Not enough EMA values yet
+//         }
 
-        // Determine current state (above or below EMA)
-        const prevState = lastClosedPrice > lastEMA ? 'above' : 'below';
-        const currentState = currentPrice > lastEMA ? 'above' : 'below';
+//         // Get the last closed price and EMA
+//         const lastClosedPrice = klines[klines.length - 1].close;
+//         const lastEMA = emaValues[emaValues.length - 1];
 
-        // If state changed, we have a potential real-time crossover
-        if (prevState !== currentState) {
-            // Calculate difference percentage
-            const difference = (currentPrice - lastEMA) / lastEMA * 100;
+//         // Determine current state (above or below EMA)
+//         const prevState = lastClosedPrice > lastEMA ? 'above' : 'below';
+//         const currentState = currentPrice > lastEMA ? 'above' : 'below';
 
-            // Only log if explicitly requested (for debugging)
-            if (logUnconfirmed) {
-                // Log the potential crossover but don't send alert yet
-                console.log('\n');
-                const crossType = currentState === 'above' ? 'up' : 'down';
-                const crossLabel = crossType === 'up' ?
-                    '▲'.yellow + ' POTENTIAL UPWARD CROSSOVER '.black.bgYellow :
-                    '▼'.yellow + ' POTENTIAL DOWNWARD CROSSOVER '.black.bgYellow;
+//         // If state changed, we have a potential real-time crossover
+//         if (prevState !== currentState) {
+//             // Calculate difference percentage
+//             const difference = (currentPrice - lastEMA) / lastEMA * 100;
 
-                console.log(crossLabel + ' ' + symbol.bold);
-                console.log(`  Current Price: ${formatPrice(currentPrice)[crossType === 'up' ? 'green' : 'red']}`);
-                console.log(`  EMA(${EMA_PERIOD}): ${formatPrice(lastEMA).cyan}`);
-                console.log(`  Difference: ${difference.toFixed(2)}%`.yellow);
-                console.log(`  Status: ${'REAL-TIME (Unconfirmed)'.yellow}`);
-            }
+//             // Only log if explicitly requested (for debugging)
+//             if (logUnconfirmed) {
+//                 // Log the potential crossover but don't send alert yet
+//                 console.log('\n');
+//                 const crossType = currentState === 'above' ? 'up' : 'down';
+//                 const crossLabel = crossType === 'up' ?
+//                     '▲'.yellow + ' POTENTIAL UPWARD CROSSOVER '.black.bgYellow :
+//                     '▼'.yellow + ' POTENTIAL DOWNWARD CROSSOVER '.black.bgYellow;
 
-            // Only log to file, not to console
-            fs.appendFileSync(
-                getDailyLogPath(),
-                `[${new Date().toISOString()}] Potential ${currentState === 'above' ? 'upward' : 'downward'} crossover detected for ${symbol} (unconfirmed)\n`
-            );
-        }
-    } catch (error) {
-        // Only log to file, not to console
-        fs.appendFileSync(
-            getDailyLogPath(),
-            `[${new Date().toISOString()}] Error processing real-time candle for ${symbol}: ${error.message}\n`
-        );
-    }
-}
+//                 console.log(crossLabel + ' ' + symbol.bold);
+//                 console.log(`  Current Price: ${formatPrice(currentPrice)[crossType === 'up' ? 'green' : 'red']}`);
+//                 console.log(`  EMA(${EMA_PERIOD}): ${formatPrice(lastEMA).cyan}`);
+//                 console.log(`  Difference: ${difference.toFixed(2)}%`.yellow);
+//                 console.log(`  Status: ${'REAL-TIME (Unconfirmed)'.yellow}`);
+//             }
+
+//             // Only log to file, not to console
+//             fs.appendFileSync(
+//                 getDailyLogPath(),
+//                 `[${new Date().toISOString()}] Potential ${currentState === 'above' ? 'upward' : 'downward'} crossover detected for ${symbol} (unconfirmed)\n`
+//             );
+//         }
+//     } catch (error) {
+//         // Only log to file, not to console
+//         fs.appendFileSync(
+//             getDailyLogPath(),
+//             `[${new Date().toISOString()}] Error processing real-time candle for ${symbol}: ${error.message}\n`
+//         );
+//     }
+// }
 
 // Function to update future price change for training data
 async function updateFuturePriceChange(symbol, timestamp) {
@@ -1229,39 +1291,43 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
 }
 
 // Check for dual EMA(9) vs EMA(15) crossover
-async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, lastEma15, currentPrice) {
+// tf — '5m' or '15m' in dual-TF mode; '' in legacy single-TF mode
+async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, lastEma15, currentPrice, tf = '') {
     try {
         // State: is EMA(9) above or below EMA(15)?
         const currentState = lastEma9 > lastEma15 ? 'ema9_above' : 'ema9_below';
         const difference = (lastEma9 - lastEma15) / lastEma15 * 100;
+        const tfTag = tf ? ` [${tf.toUpperCase()}]` : '';
 
         // Bullish: EMA(9) crosses above EMA(15) (with minimum margin)
         if (prevEma9 < prevEma15 && lastEma9 > lastEma15 && (lastEma9 - lastEma15) / lastEma15 > MIN_CROSS_PCT) {
             console.log('\n');
-            console.log('▲'.green + ' EMA 9/15 BULLISH CROSSOVER '.white.bgGreen + ' ' + symbol.bold);
+            console.log('▲'.green + ` EMA 9/15 BULLISH CROSSOVER${tfTag} `.white.bgGreen + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).green}`);
             console.log(`  EMA(15): ${formatPrice(prevEma15).gray} → ${formatPrice(lastEma15).cyan}`);
             console.log(`  Price: ${formatPrice(currentPrice).white}`);
             console.log(`  EMA Spread: ${difference.toFixed(4)}%`.yellow);
 
-            if (shouldAlert(symbol, currentState)) {
-                await sendDualEmaAlert(symbol, 'up', currentPrice, lastEma9, lastEma15, difference);
+            if (shouldAlert(symbol, currentState, tf)) {
+                await sendDualEmaAlert(symbol, 'up', currentPrice, lastEma9, lastEma15, difference, tf);
             }
         }
         // Bearish: EMA(9) crosses below EMA(15) (with minimum margin)
         else if (prevEma9 > prevEma15 && lastEma9 < lastEma15 && (lastEma15 - lastEma9) / lastEma15 > MIN_CROSS_PCT) {
             console.log('\n');
-            console.log('▼'.red + ' EMA 9/15 BEARISH CROSSOVER '.white.bgRed + ' ' + symbol.bold);
+            console.log('▼'.red + ` EMA 9/15 BEARISH CROSSOVER${tfTag} `.white.bgRed + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).red}`);
             console.log(`  EMA(15): ${formatPrice(prevEma15).gray} → ${formatPrice(lastEma15).cyan}`);
             console.log(`  Price: ${formatPrice(currentPrice).white}`);
             console.log(`  EMA Spread: ${difference.toFixed(4)}%`.yellow);
 
-            if (shouldAlert(symbol, currentState)) {
-                await sendDualEmaAlert(symbol, 'down', currentPrice, lastEma9, lastEma15, difference);
+            if (shouldAlert(symbol, currentState, tf)) {
+                await sendDualEmaAlert(symbol, 'down', currentPrice, lastEma9, lastEma15, difference, tf);
             }
         } else {
-            coinStates.set(symbol, currentState);
+            // No crossover — update tracked state so future crossovers are detected
+            const stateKey = tf ? tfKey(symbol, tf) : symbol;
+            coinStates.set(stateKey, currentState);
         }
     } catch (error) {
         log(`Error checking dual EMA crossover for ${symbol}: ${error.message}`, 'error');
@@ -1269,10 +1335,14 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
 }
 
 // Send Telegram alert for dual EMA 9/15 crossover
-async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread) {
+// tf — '5m' or '15m' in dual-TF mode; '' for legacy single-TF mode
+async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, tf = '') {
     try {
-        const emoji = crossType === 'up' ? '🟢' : '🔴';
-        const signal = crossType === 'up' ? 'BULLISH EMA 9/15 CROSS' : 'BEARISH EMA 9/15 CROSS';
+        const emoji   = crossType === 'up' ? '🟢' : '🔴';
+        const tfLabel = tf ? ` [${tf.toUpperCase()}]` : '';
+        const signal  = crossType === 'up'
+            ? `BULLISH EMA 9/15 CROSS${tfLabel}`
+            : `BEARISH EMA 9/15 CROSS${tfLabel}`;
 
         // Get 24hr stats
         const stats = await get24HrStats(symbol);
@@ -1288,7 +1358,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread) {
             `*EMA Spread:* ${spread.toFixed(4)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
-            `*Timeframe:* ${TIMEFRAME}\n\n` +
+            `*Timeframe:* ${activeTimeframeLabel(tf)}\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
 
@@ -1300,17 +1370,18 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread) {
         // Show desktop notification — mirrors Telegram message content
         // Clicking the toast opens the TradingView chart in the browser
         showDesktopNotification(
-            `${crossType === 'up' ? '🟢 EMA 9/15 BULL' : '🔴 EMA 9/15 BEAR'} — ${symbol}`,
-            `EMA(9): ${formatPrice(ema9)}  EMA(15): ${formatPrice(ema15)}\nSpread: ${spread.toFixed(4)}%  24h: ${stats.priceChangePercent}%\nVol: ${formatVolume(stats.quoteVolume)}  TF: ${TIMEFRAME}`,
+            `${crossType === 'up' ? '🟢 EMA 9/15 BULL' : '🔴 EMA 9/15 BEAR'}${tfLabel} — ${symbol}`,
+            `EMA(9): ${formatPrice(ema9)}  EMA(15): ${formatPrice(ema15)}\nSpread: ${spread.toFixed(4)}%  24h: ${stats.priceChangePercent}%\nVol: ${formatVolume(stats.quoteVolume)}  TF: ${tf || TIMEFRAME}`,
             crossType === 'up' ? 'info' : 'warning',
             tradingViewUrl
         );
 
-        log(`Dual EMA alert sent for ${symbol} (${crossType})`, 'success');
+        log(`Dual EMA alert sent for ${symbol}${tfLabel} (${crossType})`, 'success');
     } catch (error) {
         log(`Error sending dual EMA alert: ${error.message}`, 'error');
         try {
-            const simpleMsg = `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} EMA 9/15 CROSS: ${symbol} at ${formatPrice(price)}`;
+            const tfLabel = tf ? ` [${tf.toUpperCase()}]` : '';
+            const simpleMsg = `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} EMA 9/15 CROSS${tfLabel}: ${symbol} at ${formatPrice(price)}`;
             await bot.sendMessage(TELEGRAM_CHAT_ID, simpleMsg);
         } catch (retryError) {
             log(`Failed to send even simplified dual EMA message: ${retryError.message}`, 'error');
@@ -1326,8 +1397,11 @@ async function predictPriceMovement(symbol, price, ema, emaDiff) {
         // Get the ML model module
         const mlModel = require('./src/ml/model');
 
-        // Get additional features for prediction
-        const klines = klineCache.get(symbol) || [];
+        // In dual mode klines are stored under the TF-keyed cache (e.g. "BTCUSDT_15m").
+        // Using the flat symbol would always return undefined → prediction silently disabled.
+        // 15m is preferred as the ML feature source — more signal than 5m noise.
+        const mlCacheKey = DUAL_EMA_MODE ? tfKey(symbol, '15m') : symbol;
+        const klines = klineCache.get(mlCacheKey) || [];
         if (klines.length < 30) return null;
 
         const closes = klines.map(k => k.close);
@@ -1374,6 +1448,8 @@ async function predictPriceMovement(symbol, price, ema, emaDiff) {
             // Schedule accuracy update
             deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateModelAccuracy(symbol, price, prediction) });
             deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
+            // Safety cap — mirrors the cap in processClosedCandle
+            if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
         }
 
         return prediction;
@@ -1466,6 +1542,22 @@ async function setupAllWebSockets() {
     }
 }
 
+// Fetch REST promises in small batches to avoid saturating enforceRateLimit.
+// Without chunking, a concurrent Promise.all on 80+ getKlines calls all read the
+// same lastApiCall timestamp in the same millisecond — effectively bypassing the
+// rate limiter and triggering Binance 429s which cause a 5-minute backoff stall.
+async function fetchInChunks(promises, chunkSize = 8, delayMs = 1500) {
+    const results = [];
+    for (let i = 0; i < promises.length; i += chunkSize) {
+        const batch = promises.slice(i, i + chunkSize);
+        results.push(...await Promise.all(batch));
+        if (i + chunkSize < promises.length) {
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+    }
+    return results;
+}
+
 // Check for EMA crossovers (traditional method, still used for initial load and periodic checks)
 async function checkEMACross() {
     try {
@@ -1476,52 +1568,70 @@ async function checkEMACross() {
         process.stdout.write('Processing: '.cyan);
 
         // Fetch klines for all pairs concurrently with error handling
-        const klinesPromises = pairs.map(pair =>
-            getKlines(pair)
-                .then(klines => ({ pair, klines, error: null }))
-                .catch(error => ({ pair, klines: [], error }))
-        );
+        let results;
 
-        const results = await Promise.all(klinesPromises);
+        if (DUAL_EMA_MODE) {
+            // In dual-TF mode fetch both 5m and 15m for every pair
+            const dualPromises = [];
+            for (const tf of ['5m', '15m']) {
+                for (const pair of pairs) {
+                    dualPromises.push(
+                        getKlines(pair, tf)
+                            .then(klines => ({ pair, tf, klines, error: null }))
+                            .catch(error => ({ pair, tf, klines: [], error }))
+                    );
+                }
+            }
+            results = await fetchInChunks(dualPromises);
+        } else {
+            results = await Promise.all(
+                pairs.map(pair =>
+                    getKlines(pair)
+                        .then(klines => ({ pair, tf: null, klines, error: null }))
+                        .catch(error => ({ pair, tf: null, klines: [], error }))
+                )
+            );
+        }
 
         for (let i = 0; i < results.length; i++) {
-            const { pair, klines, error } = results[i];
+            const { pair, tf, klines, error } = results[i];
             process.stdout.write('.');
             if ((i + 1) % 50 === 0) process.stdout.write('\n  ');
 
             const requiredPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
             if (error || klines.length < requiredPeriod) {
                 if (klines.length < requiredPeriod) {
-                    log(`Skipping ${pair}: Not enough candles (${klines.length}/${requiredPeriod})`, 'warning');
+                    log(`Skipping ${pair}${tf ? ` [${tf}]` : ''}: Not enough candles (${klines.length}/${requiredPeriod})`, 'warning');
                 }
                 continue;
             }
 
-            const closes = klines.map(k => k.close);
-
             if (DUAL_EMA_MODE) {
-                // Dual EMA 9/15 crossover check
-                const ema9 = calculateEMA(closes, 9);
-                const ema15 = calculateEMA(closes, 15);
+                // Read EMAs from cache — getKlines() already populated them
+                const key = tfKey(pair, tf);
+                const e9  = ema9Cache.get(key)  || [];
+                const e15 = ema15Cache.get(key) || [];
 
-                if (ema9.length < 2 || ema15.length < 2) {
-                    log(`Skipping ${pair}: Not enough EMA values for dual mode`, 'warning');
+                if (e9.length < 2 || e15.length < 2) {
+                    log(`Skipping ${pair} [${tf}]: Not enough EMA values`, 'warning');
                     continue;
                 }
 
                 // Align arrays — EMA(9) accumulates 6 more values than EMA(15)
-                const _offset = ema9.length - ema15.length;
-                const a9  = _offset > 0 ? ema9.slice(_offset)  : ema9;
-                const a15 = _offset < 0 ? ema15.slice(-_offset) : ema15;
+                const _offset = e9.length - e15.length;
+                const a9  = _offset > 0 ? e9.slice(_offset)   : e9;
+                const a15 = _offset < 0 ? e15.slice(-_offset) : e15;
 
-                const lastEma9  = a9[a9.length - 1];
-                const prevEma9  = a9[a9.length - 2];
-                const lastEma15 = a15[a15.length - 1];
-                const prevEma15 = a15[a15.length - 2];
-
-                checkForDualEmaCrossover(pair, prevEma9, lastEma9, prevEma15, lastEma15, closes[closes.length - 1]);
+                const closes = klines.map(k => k.close);
+                checkForDualEmaCrossover(
+                    pair,
+                    a9.at(-2), a9.at(-1),
+                    a15.at(-2), a15.at(-1),
+                    closes.at(-1), tf
+                );
             } else {
                 // Single EMA crossover check (price vs EMA)
+                const closes = klines.map(k => k.close);
                 const ema = calculateEMA(closes, EMA_PERIOD);
 
                 if (ema.length < 2) {
@@ -1767,7 +1877,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `*Difference:* ${difference.toFixed(2)}%\n` +
             `*24h Change:* ${stats.priceChangePercent}%\n` +
             `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
-            `*Timeframe:* ${TIMEFRAME}\n` +
+            `*Timeframe:* ${activeTimeframeLabel()}\n` +
             `*ML Prediction:* ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
@@ -1848,7 +1958,13 @@ async function startManualDataCollection(chatId) {
 
         for (const symbol of pairs) {
             try {
-                // Get historical klines
+                // In dual mode, pre-seed the 5m EMA + kline cache via a REST call so
+                // 5m crossover detection is ready immediately. Without this the 5m
+                // bucket stays empty until the first 5m WebSocket candle closes
+                // (up to 5 minutes after manual collection finishes).
+                if (DUAL_EMA_MODE) await getKlines(symbol, '5m');
+
+                // Get historical klines (15m or flat depending on mode)
                 const klines = await getKlines(symbol);
                 if (klines.length < 30) {
                     log(`Skipping ${symbol}: Not enough candles`, 'warning');
@@ -1873,8 +1989,10 @@ async function startManualDataCollection(chatId) {
                         v: candle.volume.toString()
                     };
 
-                    // Process this candle
-                    await processClosedCandle(symbol, klineObj);
+                    // Process this candle — pass tf so dual mode writes to the correct cache key
+                    // (symbol_15m) rather than the flat (symbol) bucket
+                    const replayTf = DUAL_EMA_MODE ? '15m' : null;
+                    await processClosedCandle(symbol, klineObj, replayTf);
                 }
 
                 successCount++;
@@ -2000,6 +2118,10 @@ async function handleCallbackQuery(callbackQuery) {
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
         } else if (action.startsWith('ema_')) {
             const newEma = parseInt(action.replace('ema_', ''), 10);
+            if (!VALID_EMA_PERIODS.includes(newEma)) {
+                await bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ Invalid EMA period.' });
+                return;
+            }
             EMA_PERIOD = newEma;
             DUAL_EMA_MODE = false;
             log(`EMA period updated to ${newEma}, dual mode disabled`, 'success');
@@ -2021,7 +2143,7 @@ async function handleCallbackQuery(callbackQuery) {
             await bot.sendMessage(
                 chatId,
                 DUAL_EMA_MODE
-                    ? '✅ *EMA 9/15 Crossover Mode Enabled*\nAlerts will fire when EMA(9) crosses EMA(15). Single EMA settings are ignored.'
+                    ? '✅ *EMA 9/15 Crossover Mode Enabled [5m + 15m]*\nAlerts will fire when EMA(9) crosses EMA(15) on BOTH the 5-minute and 15-minute timeframes independently. Single EMA settings are ignored.'
                     : `✅ *EMA 9/15 Mode Disabled*\nReverted to Price vs EMA(${EMA_PERIOD}) crossover mode.`,
                 { parse_mode: 'Markdown' }
             );
@@ -2143,14 +2265,14 @@ async function sendStatusUpdate(chatId) {
 
         const message = `*EMA Tracker Status*\n\n` +
             `*Active Configuration:*\n` +
-            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
-            `- Timeframe: ${TIMEFRAME}\n` +
+            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover [5m + 15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
+            `- Timeframe: ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME}\n` +
             `- Volume Threshold: ${VOLUME_THRESHOLD.toLocaleString()}\n` +
             `- Monitoring: ${pairs.length} pairs\n` +
             `- Active WebSockets: ${activeWsCount}/${pairs.length}\n` +
             `- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n` +
             `- Last Check: ${new Date().toLocaleString()}\n\n` +
-            `Bot is actively monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15' : 'EMA'} crossovers in real-time.`;
+            `Bot is actively monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15 [5m + 15m]' : 'EMA'} crossovers in real-time.`;
 
         await bot.sendMessage(chatId, message, {
             parse_mode: 'Markdown',
@@ -2202,7 +2324,7 @@ async function sendSettingsMenu(chatId) {
     };
 
     const configText = DUAL_EMA_MODE
-        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: ${TIMEFRAME}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_When EMA 9/15 is active, single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
+        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: 5m + 15m (both monitored)\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors both 5m and 15m timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
         : `*Settings*\n\nCurrent Configuration:\n- EMA: ${EMA_PERIOD}\n- Timeframe: ${TIMEFRAME}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\nSelect a new setting:`;
 
     await bot.sendMessage(chatId, configText, {
@@ -2332,10 +2454,13 @@ async function sendModelPerformance(chatId) {
         const totalModels = modelPerformance.size;
         const totalPredictions = Array.from(modelPerformance.values())
             .reduce((sum, metrics) => sum + (metrics.predictions || 0), 0);
-        const avgAccuracy = Array.from(modelPerformance.values())
-            .filter(metrics => metrics.predictions >= 10)
-            .reduce((sum, metrics) => sum + (metrics.accuracy || 0), 0) /
-            Array.from(modelPerformance.values()).filter(metrics => metrics.predictions >= 10).length;
+        // Only include models with enough predictions to be meaningful.
+        // Guard against empty set — no qualifying models → show 0% rather than NaN.
+        const qualifiedModels = Array.from(modelPerformance.values())
+            .filter(metrics => metrics.predictions >= 10);
+        const avgAccuracy = qualifiedModels.length > 0
+            ? qualifiedModels.reduce((sum, m) => sum + (m.accuracy || 0), 0) / qualifiedModels.length
+            : 0;
 
         message += `*Summary Statistics*\n` +
             `- Total Models: ${totalModels}\n` +
@@ -2366,14 +2491,14 @@ async function sendStartupMessage() {
     try {
         const message = `🤖 *EMA Tracker Bot Started* 🤖\n\n` +
             `*Configuration:*\n` +
-            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
-            `- Timeframe: ${TIMEFRAME}\n` +
+            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover [5m + 15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
+            `- Timeframe: ${DUAL_EMA_MODE ? '5m + 15m (both monitored)' : TIMEFRAME}\n` +
             `- Volume Threshold: ${VOLUME_THRESHOLD.toLocaleString()}\n` +
             `- Check Interval: ${(CHECK_INTERVAL / 60000).toFixed(1)} minutes\n` +
             `- Alert Cooldown: ${(ALERT_COOLDOWN / 60000).toFixed(1)} minutes\n` +
             `- WebSocket Monitoring: Enabled\n` +
             `- ML Enhancement: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\n` +
-            `Bot is now monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15' : 'EMA'} crossovers in real-time${ML_ENABLED ? ' with ML predictions' : ''}...`;
+            `Bot is now monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15 crossovers on both 5m and 15m' : 'EMA crossovers'} in real-time${ML_ENABLED ? ' with ML predictions' : ''}...`;
 
         await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
         log('Startup message sent to Telegram', 'success');
@@ -2381,7 +2506,7 @@ async function sendStartupMessage() {
         // Show desktop notification — mirrors startup message content
         showDesktopNotification(
             '🤖 EMA Tracker Started',
-            `Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover' : 'Price vs EMA(' + EMA_PERIOD + ')'}\nTimeframe: ${TIMEFRAME}  Vol: ${formatVolume(VOLUME_THRESHOLD)}\nML: ${ML_ENABLED ? 'Enabled' : 'Disabled'}`,
+            `Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 [5m+15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\nTimeframe: ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME}  Vol: ${formatVolume(VOLUME_THRESHOLD)}\nML: ${ML_ENABLED ? 'Enabled' : 'Disabled'}`,
             'info'
         );
 
@@ -2429,6 +2554,17 @@ function startWebSocketHeartbeat() {
             );
         }
     }, 60000); // Check every minute
+
+    // Binance drops idle streams after ~10 minutes if no data or ping is received.
+    // Sending a ping frame every 3 minutes keeps every connection alive and also
+    // lets us detect dead connections sooner than waiting for readyState to flip.
+    setInterval(() => {
+        for (const [symbol, ws] of activeWebSockets.entries()) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.ping();
+            }
+        }
+    }, 3 * 60 * 1000);
 }
 
 // Schedule periodic model training
@@ -2547,6 +2683,9 @@ async function gracefulShutdown(signal) {
                     // Ignore errors when closing
                 }
             }
+
+        // Flush alert state so cooldowns and coin states survive the restart
+        saveAlertState();
 
         await bot.sendMessage(TELEGRAM_CHAT_ID, '⚠️ EMA Tracker Bot is shutting down...');
 
