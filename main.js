@@ -114,7 +114,7 @@ const modelPerformance = new Map(); // Track ML model accuracy
 const reconnectionAttempts = new Map(); // Track WebSocket reconnection attempts per symbol
 const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
-const MIN_CROSS_PCT = 0.0005; // 0.05% minimum crossover margin to reduce whipsaw
+const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsaw
 // Validation constants — shared by settings loader and callback handler
 const VALID_VOLUMES    = [50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
