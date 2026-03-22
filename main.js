@@ -543,7 +543,12 @@ async function getKlines(symbol, tf = null) {
 
         // Bybit response: { result: { list: [[ts,o,h,l,c,vol,turnover],...] } }
         // list is NEWEST first — reverse so oldest is first (same order as Binance)
-        const raw = response.data.result.list.reverse();
+        const list = response.data?.result?.list;
+        if (!Array.isArray(list) || list.length === 0) {
+            log(`Empty kline response for ${symbol} [${interval}] — Bybit may be rate-limiting`, 'warning');
+            return [];
+        }
+        const raw = list.reverse();
 
         const klines = raw.map(k => ({
             time:   parseInt(k[0]),
