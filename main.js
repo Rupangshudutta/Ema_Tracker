@@ -23,7 +23,7 @@ let EMA_PERIOD = parseInt(process.env.EMA_PERIOD, 10) || 200;
 let TIMEFRAME = process.env.TIMEFRAME || '15m';
 let VOLUME_THRESHOLD = parseInt(process.env.VOLUME_THRESHOLD, 10) || 100_000_000;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL, 10) || 5 * 60 * 1000; // 5 minutes
-const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 15 * 60 * 1000; // 15 minutes cooldown for alerts
+const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 1 * 60 * 1000; // 1 minute cooldown for alerts
 
 // Telegram configuration — must be provided via environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
