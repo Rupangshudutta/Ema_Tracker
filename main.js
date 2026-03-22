@@ -49,8 +49,7 @@ if (!/^\d+:[A-Za-z0-9_-]{35,}$/.test(TELEGRAM_BOT_TOKEN)) {
 // Initialize Telegram bot with better error handling
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { 
     polling: {
-      timeout: 30, // Shorter timeout
-      limit: 100,
+      params: { timeout: 30, limit: 100 },
       retryTimeout: 5000 // Wait 5 seconds before retrying on error
     }
   });
@@ -926,6 +925,12 @@ function setupPooledWebSockets(allSymbols) {
 
 // Subscribe a single new symbol to an existing pool connection (mid-session discovery).
 function subscribeSymbolToPool(symbol) {
+    // Skip if already subscribed in any pool connection
+    if (wsPool.some(e => e && e.symbols.has(symbol))) {
+        log(`${symbol} already subscribed in pool — skipping`, 'info');
+        return;
+    }
+
     if (ML_ENABLED) {
         const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
         fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
@@ -2890,6 +2895,8 @@ bot.on('callback_query', handleCallbackQuery);
 async function gracefulShutdown(signal) {
     try {
         log(`Received ${signal}. Shutting down gracefully...`, 'warning');
+        // Prevent pool close handlers from scheduling reconnects during shutdown
+        isReconnecting = true;
         // Close all pool WebSocket connections
         for (const entry of wsPool) {
             if (entry && entry.ws) {
