@@ -54,25 +54,52 @@ bot.on('polling_error', (error) => {
     // Restart polling after a delay if connection was reset
     if (error.code === 'ECONNRESET' || error.code === 'EFATAL') {
       log('Connection reset, restarting polling in 10 seconds...', 'warning');
+      isReconnecting = true;
       setTimeout(() => {
         try {
           bot.stopPolling();
           setTimeout(() => {
             bot.startPolling();
+            isReconnecting = false;
             log('Telegram polling restarted successfully', 'success');
           }, 1000);
         } catch (e) {
+          isReconnecting = false;
           log(`Failed to restart polling: ${e.message}`, 'error');
         }
       }, 10000);
     }
   });
 
-  
+
 // Store last alert times and states for each symbol
 const lastAlerts = new Map();
 const coinStates = new Map(); // Tracks the current state of each coin (above/below EMA)
 const trackedPairs = new Set(); // Keep track of pairs we're already monitoring
+
+// Persist and restore alert state so restarts don't re-fire existing crossovers
+const ALERT_STATE_PATH = path.join(__dirname, 'alert_state.json');
+function loadAlertState() {
+    try {
+        if (!fs.existsSync(ALERT_STATE_PATH)) return;
+        const { alerts, states } = JSON.parse(fs.readFileSync(ALERT_STATE_PATH, 'utf8'));
+        if (Array.isArray(alerts)) for (const [k, v] of alerts) lastAlerts.set(k, v);
+        if (Array.isArray(states)) for (const [k, v] of states) coinStates.set(k, v);
+        log('Alert state restored from disk', 'info');
+    } catch (e) {
+        log(`Could not load alert state: ${e.message}`, 'warning');
+    }
+}
+function saveAlertState() {
+    fs.writeFile(ALERT_STATE_PATH, JSON.stringify({
+        alerts: [...lastAlerts.entries()],
+        states: [...coinStates.entries()]
+    }), () => {});
+}
+
+// Deferred update queue — replaces unbounded 24h setTimeout calls
+// Each entry: { executeAt: timestamp, fn: async () => ... }
+const deferredUpdates = [];
 
 // WebSocket related variables
 const activeWebSockets = new Map(); // Track active WebSocket connections
@@ -85,8 +112,40 @@ const modelPerformance = new Map(); // Track ML model accuracy
 const reconnectionAttempts = new Map(); // Track WebSocket reconnection attempts per symbol
 const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
+const MIN_CROSS_PCT = 0.0005; // 0.05% minimum crossover margin to reduce whipsaw
+// Validation constants — shared by settings loader and callback handler
+const VALID_VOLUMES    = [50_000_000, 100_000_000, 200_000_000];
+const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
+const VALID_EMA_PERIODS = [50, 100, 200];
 let isReconnecting = false; // Prevents stacked reconnections during graceful restarts
 let monitoringInterval = null; // Reference to the periodic check interval
+
+// Telegram circuit breaker — pauses alert sends after 5 consecutive failures
+let _tgFailCount = 0;
+let _tgPausedUntil = 0;
+async function safeSendAlert(chatId, text, opts) {
+    if (Date.now() < _tgPausedUntil) {
+        log('Telegram circuit open — alert suppressed', 'warning');
+        return;
+    }
+    try {
+        await bot.sendMessage(chatId, text, opts);
+        _tgFailCount = 0;
+    } catch (e) {
+        if (++_tgFailCount >= 5) {
+            _tgPausedUntil = Date.now() + 5 * 60 * 1000;
+            log('Telegram circuit breaker tripped — pausing sends for 5 minutes', 'warning');
+            _tgFailCount = 0;
+        }
+        throw e;
+    }
+}
+
+// Build a TradingView chart URL for a given symbol (handles non-USDT pairs gracefully)
+function getTradingViewUrl(symbol) {
+    const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USDT.P`;
+}
 let _indicatorsModule = null; // Cached module ref — avoids repeated require() on every closed candle
 // Rate limiting for API calls
 const API_RATE_LIMIT = 1200; // 1.2 seconds between API calls
@@ -96,12 +155,13 @@ let lastApiCall = 0;
 function enforceRateLimit() {
     const now = Date.now();
     const timeSinceLastCall = now - lastApiCall;
-    
+
     if (timeSinceLastCall < API_RATE_LIMIT) {
         const delay = API_RATE_LIMIT - timeSinceLastCall;
+        lastApiCall = now + delay;
         return new Promise(resolve => setTimeout(resolve, delay));
     }
-    
+
     lastApiCall = now;
     return Promise.resolve();
 }
@@ -118,6 +178,18 @@ const MODEL_PATH = path.join(__dirname, 'ml_models');
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) {
     fs.mkdirSync(LOG_DIR);
+}
+
+// Cached daily log file path — refreshes once per day to avoid per-call allocations
+let _cachedLogDate = '';
+let _cachedLogPath = '';
+function getDailyLogPath() {
+    const today = new Date().toISOString().split('T')[0];
+    if (today !== _cachedLogDate) {
+        _cachedLogDate = today;
+        _cachedLogPath = path.join(LOG_DIR, `ema-tracker-${today}.log`);
+    }
+    return _cachedLogPath;
 }
 
 // Create ML directories
@@ -154,7 +226,7 @@ function log(message, type = 'info') {
     }
 
     // File logging
-    const logFile = path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`);
+    const logFile = getDailyLogPath();
     fs.appendFileSync(logFile, logMessage + '\n');
 }
 
@@ -344,10 +416,13 @@ async function getFuturesPairs() {
     } catch (error) {
         log(`Error fetching futures pairs: ${error.message}`, 'error');
         
-        // If we get rate limited, wait longer before next call
-        if (error.response && error.response.status === 418) {
-            log('Rate limited by Binance. Waiting 5 minutes before next call...', 'warning');
+        // Handle Binance rate-limit (429) and IP-ban (418) separately
+        if (error.response && error.response.status === 429) {
+            log('Rate limited by Binance (429). Waiting 5 minutes before next call...', 'warning');
             await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
+        } else if (error.response && error.response.status === 418) {
+            log('IP banned by Binance (418). Waiting 30 minutes before next call...', 'error');
+            await new Promise(resolve => setTimeout(resolve, 30 * 60 * 1000));
         }
         
         return [];
@@ -369,12 +444,11 @@ async function alertNewHighVolumePairs(newPairs) {
             await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
 
             // Show desktop notification — match Telegram content
-            const tvSymNew = pair.symbol.replace('USDT', '');
             showDesktopNotification(
                 `🔔 New High Volume Pair: ${pair.symbol}`,
                 `Volume: ${formatVolume(pair.volume)}  Price: ${formatPrice(pair.price)}\n24h Change: ${pair.change.toFixed(2)}%  Added to monitoring`,
                 'info',
-                `https://www.tradingview.com/chart/?symbol=BINANCE:${tvSymNew}USDT.P`
+                getTradingViewUrl(pair.symbol)
             );
 
             log(`New high volume pair alert sent for ${pair.symbol} with volume ${formatVolume(pair.volume)}`, 'success');
@@ -503,8 +577,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
         const stats = await get24HrStats(symbol);
 
         // Create a TradingView link
-        const tvSymbol = symbol.replace('USDT', '');
-        const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=BINANCE:${tvSymbol}USDT.P`;
+        const tradingViewUrl = getTradingViewUrl(symbol);
 
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
@@ -517,7 +590,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
 
-        await bot.sendMessage(TELEGRAM_CHAT_ID, message, {
+        await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
@@ -550,18 +623,19 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
 function shouldAlert(symbol, currentState) {
     const now = Date.now();
     const previousState = coinStates.get(symbol);
-    const lastAlertTime = lastAlerts.get(symbol) || 0;
+    // Per-direction key so bullish and bearish each have their own cooldown window
+    const alertKey = `${symbol}_${currentState}`;
+    const lastAlertTime = lastAlerts.get(alertKey) || 0;
 
-    if (previousState !== currentState) {
+    if (previousState !== currentState && now - lastAlertTime >= ALERT_COOLDOWN) {
         coinStates.set(symbol, currentState);
-        if (now - lastAlertTime >= ALERT_COOLDOWN) {
-            lastAlerts.set(symbol, now);
-            return true;
-        } else {
-            log(`Alert for ${symbol} skipped due to cooldown.`, 'warning');
-        }
+        lastAlerts.set(alertKey, now);
+        saveAlertState();
+        return true;
+    } else if (previousState !== currentState) {
+        log(`Alert for ${symbol} (${currentState}) skipped due to cooldown.`, 'warning');
     }
-    return false; // No alert if state hasn't changed or cooldown active
+    return false;
 }
 
 // WebSocket setup for a symbol
@@ -668,31 +742,6 @@ function setupSymbolWebSocket(symbol) {
     }
 }
 
-// Helper function to calculate ATR (Average True Range)
-// function calculateATR(klines, period = 14) {
-//     if (klines.length < period + 1) return null;
-
-//     const trueRanges = [];
-
-//     // Calculate True Range for each candle
-//     for (let i = 1; i < klines.length; i++) {
-//         const high = klines[i].high;
-//         const low = klines[i].low;
-//         const prevClose = klines[i - 1].close;
-
-//         const tr1 = high - low;
-//         const tr2 = Math.abs(high - prevClose);
-//         const tr3 = Math.abs(low - prevClose);
-
-//         trueRanges.push(Math.max(tr1, tr2, tr3));
-//     }
-
-//     // Calculate ATR as average of true ranges
-//     if (trueRanges.length < period) return null;
-
-//     const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
-//     return atr;
-// }
 
 // Process a closed candle from WebSocket with improved ML data collection
 async function processClosedCandle(symbol, kline) {
@@ -735,13 +784,15 @@ async function processClosedCandle(symbol, kline) {
 
             // Check for dual EMA crossover (EMA9 vs EMA15)
             if (ema9Values.length >= 2 && ema15Values.length >= 2) {
-                // Align arrays: both start from period=15, so ema9 has extra entries
-                // ema9 starts at index 9, ema15 starts at index 15
-                // We need the last 2 values from each, aligned to the same candle
-                const lastEma9 = ema9Values[ema9Values.length - 1];
-                const prevEma9 = ema9Values[ema9Values.length - 2];
-                const lastEma15 = ema15Values[ema15Values.length - 1];
-                const prevEma15 = ema15Values[ema15Values.length - 2];
+                // Align arrays: EMA(9) starts 6 candles earlier than EMA(15), so trim the longer array
+                const offset = ema9Values.length - ema15Values.length;
+                const alignedEma9 = offset > 0 ? ema9Values.slice(offset) : ema9Values;
+                const alignedEma15 = offset < 0 ? ema15Values.slice(-offset) : ema15Values;
+
+                const lastEma9 = alignedEma9[alignedEma9.length - 1];
+                const prevEma9 = alignedEma9[alignedEma9.length - 2];
+                const lastEma15 = alignedEma15[alignedEma15.length - 1];
+                const prevEma15 = alignedEma15[alignedEma15.length - 2];
 
                 checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, lastEma15, closes[closes.length - 1]);
             }
@@ -825,7 +876,8 @@ async function processClosedCandle(symbol, kline) {
             }
 
             // Schedule update of future price change (after 24 hours)
-            setTimeout(() => updateFuturePriceChange(symbol, kline.t), 24 * 60 * 60 * 1000);
+            deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, kline.t) });
+            deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
         }
     } catch (error) {
         log(`Error processing closed candle for ${symbol}: ${error.message}`, 'error');
@@ -833,7 +885,7 @@ async function processClosedCandle(symbol, kline) {
 }
 
 // Save data point to JSON file
-function saveDataPoint(symbol, dataPoint) {
+async function saveDataPoint(symbol, dataPoint) {
     try {
         // Create directory for this symbol if it doesn't exist
         const symbolDir = path.join(ML_DATA_DIR, symbol);
@@ -846,14 +898,13 @@ function saveDataPoint(symbol, dataPoint) {
         const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.json`;
         const filePath = path.join(symbolDir, filename);
 
-        // Load existing data or create new array
+        // Load existing data or create new array (async — won't block the event loop)
         let data = [];
         if (fs.existsSync(filePath)) {
             try {
-                data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                data = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
             } catch (e) {
                 log(`Error reading data file for ${symbol}: ${e.message}`, 'error');
-                // If file is corrupted, start fresh
                 data = [];
             }
         }
@@ -879,25 +930,11 @@ function saveDataPoint(symbol, dataPoint) {
 }
 
 // Export training data to CSV for easier model training
-function exportToCSV(symbol) {
-    try {
-        if (!trainingData.has(symbol) || trainingData.get(symbol).length === 0) {
-            return;
-        }
-
-        const data = trainingData.get(symbol);
-
-        // Create directory for this symbol if it doesn't exist
-        const symbolDir = path.join(CSV_DATA_DIR, symbol);
-        if (!fs.existsSync(symbolDir)) {
-            fs.mkdirSync(symbolDir, { recursive: true });
-        }
-
-        // Create CSV file path
-        const csvPath = path.join(symbolDir, `${symbol}_training_data.csv`);
-
-        // Define CSV writer
-        const csvWriter = createObjectCsvWriter({
+// Cache one CsvWriter instance per file path — avoids reallocating on every candle close
+const csvWriterCache = new Map();
+function getCsvWriter(csvPath) {
+    if (!csvWriterCache.has(csvPath)) {
+        csvWriterCache.set(csvPath, createObjectCsvWriter({
             path: csvPath,
             header: [
                 { id: 'timestamp', title: 'TIMESTAMP' },
@@ -922,7 +959,30 @@ function exportToCSV(symbol) {
                 { id: 'future_price_change', title: 'FUTURE_PRICE_CHANGE' },
                 { id: 'label', title: 'LABEL' }
             ]
-        });
+        }));
+    }
+    return csvWriterCache.get(csvPath);
+}
+
+function exportToCSV(symbol) {
+    try {
+        if (!trainingData.has(symbol) || trainingData.get(symbol).length === 0) {
+            return;
+        }
+
+        const data = trainingData.get(symbol);
+
+        // Create directory for this symbol if it doesn't exist
+        const symbolDir = path.join(CSV_DATA_DIR, symbol);
+        if (!fs.existsSync(symbolDir)) {
+            fs.mkdirSync(symbolDir, { recursive: true });
+        }
+
+        // Create CSV file path
+        const csvPath = path.join(symbolDir, `${symbol}_training_data.csv`);
+
+        // Define CSV writer (cached per path — avoids re-allocation on every call)
+        const csvWriter = getCsvWriter(csvPath);
 
         // Write data to CSV
         csvWriter.writeRecords(data)
@@ -1003,14 +1063,14 @@ function processRealtimeCandle(symbol, kline, logUnconfirmed = true) {
 
             // Only log to file, not to console
             fs.appendFileSync(
-                path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+                getDailyLogPath(),
                 `[${new Date().toISOString()}] Potential ${currentState === 'above' ? 'upward' : 'downward'} crossover detected for ${symbol} (unconfirmed)\n`
             );
         }
     } catch (error) {
         // Only log to file, not to console
         fs.appendFileSync(
-            path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+            getDailyLogPath(),
             `[${new Date().toISOString()}] Error processing real-time candle for ${symbol}: ${error.message}\n`
         );
     }
@@ -1035,8 +1095,9 @@ async function updateFuturePriceChange(symbol, timestamp) {
 
         // Update the data point
         dataPoint.future_price_change = priceChange;
-        dataPoint.label = priceChange >= 0 ? 1 : 0;
-
+        // 3-class label: 0 = bearish (<-1%), 1 = neutral, 2 = bullish (>+1%)
+        const LABEL_THRESHOLD = 1.0;
+        dataPoint.label = priceChange > LABEL_THRESHOLD ? 2 : priceChange < -LABEL_THRESHOLD ? 0 : 1;
         log(`Updated future price change for ${symbol}: ${priceChange.toFixed(2)}%`, 'info');
 
         // Update the data in JSON files
@@ -1050,7 +1111,7 @@ async function updateFuturePriceChange(symbol, timestamp) {
 }
 
 // Update a stored data point in JSON files
-function updateStoredDataPoint(symbol, timestamp, priceChange) {
+async function updateStoredDataPoint(symbol, timestamp, priceChange) {
     try {
         // Find the file containing this timestamp
         const symbolDir = path.join(ML_DATA_DIR, symbol);
@@ -1062,14 +1123,14 @@ function updateStoredDataPoint(symbol, timestamp, priceChange) {
 
         for (const file of files) {
             const filePath = path.join(symbolDir, file);
-            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            const data = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
 
             // Find the data point with matching timestamp
             const index = data.findIndex(d => d.timestamp === timestamp);
             if (index !== -1) {
                 // Update the future price change
                 data[index].future_price_change = priceChange;
-                data[index].label = priceChange >= 0 ? 1 : 0;
+                data[index].label = priceChange > 1.0 ? 2 : priceChange < -1.0 ? 0 : 1;
 
                 // Save the updated data asynchronously
                 fs.writeFile(filePath, JSON.stringify(data, null, 2), (err) => {
@@ -1119,8 +1180,8 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
             }
         }
 
-        // Upward crossover: price crossing from below to above EMA
-        if (prevPrice < prevEMA && lastPrice > lastEMA) {
+        // Upward crossover: price crossing from below to above EMA (with minimum margin)
+        if (prevPrice < prevEMA && lastPrice > lastEMA && (lastPrice - lastEMA) / lastEMA > MIN_CROSS_PCT) {
             console.log('\n');
             console.log('▲'.green + ' UPWARD CROSSOVER '.white.bgGreen + ' ' + symbol.bold);
             console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).green}`);
@@ -1139,8 +1200,8 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 }
             }
         }
-        // Downward crossover: price crossing from above to below EMA
-        else if (prevPrice > prevEMA && lastPrice < lastEMA) {
+        // Downward crossover: price crossing from above to below EMA (with minimum margin)
+        else if (prevPrice > prevEMA && lastPrice < lastEMA && (lastEMA - lastPrice) / lastEMA > MIN_CROSS_PCT) {
             console.log('\n');
             console.log('▼'.red + ' DOWNWARD CROSSOVER '.white.bgRed + ' ' + symbol.bold);
             console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).red}`);
@@ -1174,8 +1235,8 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
         const currentState = lastEma9 > lastEma15 ? 'ema9_above' : 'ema9_below';
         const difference = (lastEma9 - lastEma15) / lastEma15 * 100;
 
-        // Bullish: EMA(9) crosses above EMA(15)
-        if (prevEma9 < prevEma15 && lastEma9 > lastEma15) {
+        // Bullish: EMA(9) crosses above EMA(15) (with minimum margin)
+        if (prevEma9 < prevEma15 && lastEma9 > lastEma15 && (lastEma9 - lastEma15) / lastEma15 > MIN_CROSS_PCT) {
             console.log('\n');
             console.log('▲'.green + ' EMA 9/15 BULLISH CROSSOVER '.white.bgGreen + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).green}`);
@@ -1187,8 +1248,8 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
                 await sendDualEmaAlert(symbol, 'up', currentPrice, lastEma9, lastEma15, difference);
             }
         }
-        // Bearish: EMA(9) crosses below EMA(15)
-        else if (prevEma9 > prevEma15 && lastEma9 < lastEma15) {
+        // Bearish: EMA(9) crosses below EMA(15) (with minimum margin)
+        else if (prevEma9 > prevEma15 && lastEma9 < lastEma15 && (lastEma15 - lastEma9) / lastEma15 > MIN_CROSS_PCT) {
             console.log('\n');
             console.log('▼'.red + ' EMA 9/15 BEARISH CROSSOVER '.white.bgRed + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).red}`);
@@ -1217,8 +1278,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread) {
         const stats = await get24HrStats(symbol);
 
         // TradingView link
-        const tvSymbol = symbol.replace('USDT', '');
-        const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=BINANCE:${tvSymbol}USDT.P`;
+        const tradingViewUrl = getTradingViewUrl(symbol);
 
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
@@ -1232,7 +1292,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread) {
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
 
-        await bot.sendMessage(TELEGRAM_CHAT_ID, message, {
+        await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
@@ -1312,7 +1372,8 @@ async function predictPriceMovement(symbol, price, ema, emaDiff) {
             }
 
             // Schedule accuracy update
-            setTimeout(() => updateModelAccuracy(symbol, price, prediction), 24 * 60 * 60 * 1000);
+            deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateModelAccuracy(symbol, price, prediction) });
+            deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
         }
 
         return prediction;
@@ -1360,7 +1421,7 @@ async function setupAllWebSockets() {
 
         // Only log to file, not to console
         fs.appendFileSync(
-            path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+            getDailyLogPath(),
             `[${new Date().toISOString()}] Setting up WebSockets for ${pairs.length} pairs\n`
         );
 
@@ -1369,7 +1430,7 @@ async function setupAllWebSockets() {
             if (!pairs.includes(symbol)) {
                 // Only log to file, not to console
                 fs.appendFileSync(
-                    path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+                    getDailyLogPath(),
                     `[${new Date().toISOString()}] Closing WebSocket for ${symbol} (no longer tracked)\n`
                 );
                 try {
@@ -1393,13 +1454,13 @@ async function setupAllWebSockets() {
 
         // Only log to file, not to console
         fs.appendFileSync(
-            path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+            getDailyLogPath(),
             `[${new Date().toISOString()}] WebSocket setup completed for ${pairs.length} pairs\n`
         );
     } catch (error) {
         // Only log to file, not to console
         fs.appendFileSync(
-            path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+            getDailyLogPath(),
             `[${new Date().toISOString()}] Error setting up WebSockets: ${error.message}\n`
         );
     }
@@ -1448,10 +1509,15 @@ async function checkEMACross() {
                     continue;
                 }
 
-                const lastEma9 = ema9[ema9.length - 1];
-                const prevEma9 = ema9[ema9.length - 2];
-                const lastEma15 = ema15[ema15.length - 1];
-                const prevEma15 = ema15[ema15.length - 2];
+                // Align arrays — EMA(9) accumulates 6 more values than EMA(15)
+                const _offset = ema9.length - ema15.length;
+                const a9  = _offset > 0 ? ema9.slice(_offset)  : ema9;
+                const a15 = _offset < 0 ? ema15.slice(-_offset) : ema15;
+
+                const lastEma9  = a9[a9.length - 1];
+                const prevEma9  = a9[a9.length - 2];
+                const lastEma15 = a15[a15.length - 1];
+                const prevEma15 = a15[a15.length - 2];
 
                 checkForDualEmaCrossover(pair, prevEma9, lastEma9, prevEma15, lastEma15, closes[closes.length - 1]);
             } else {
@@ -1692,8 +1758,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
         }
 
         // Create a TradingView link
-        const tvSymbol = symbol.replace('USDT', '');
-        const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=BINANCE:${tvSymbol}USDT.P`;
+        const tradingViewUrl = getTradingViewUrl(symbol);
 
         const message = `${emoji} *${signal}* ${emoji}\n\n` +
             `*Symbol:* ${symbol}\n` +
@@ -1707,7 +1772,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `*Time:* ${new Date().toLocaleString()}\n\n` +
             `[View Chart on TradingView](${tradingViewUrl})`;
 
-        await bot.sendMessage(TELEGRAM_CHAT_ID, message, {
+        await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
@@ -1923,7 +1988,6 @@ async function handleCallbackQuery(callbackQuery) {
             exportAllDataToCSV();
             await bot.sendMessage(chatId, '📊 All training data exported to CSV format successfully!');
         } else if (action.startsWith('timeframe_')) {
-            const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
             const newTimeframe = action.replace('timeframe_', '');
             if (!VALID_TIMEFRAMES.includes(newTimeframe)) {
                 await bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ Invalid timeframe.' });
@@ -2028,12 +2092,9 @@ function loadSettings() {
             const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
 
             // Update variables with saved settings (whitelist-validated to prevent corrupted settings file)
-            const VALID_TIMEFRAMES_LOAD = ['1m', '5m', '15m', '1h', '4h'];
-            const VALID_EMA_PERIODS_LOAD = [50, 100, 200];
-            const VALID_VOLUMES_LOAD = [50000000, 100000000, 200000000];
-            if (VALID_EMA_PERIODS_LOAD.includes(settings.EMA_PERIOD)) EMA_PERIOD = settings.EMA_PERIOD;
-            if (VALID_TIMEFRAMES_LOAD.includes(settings.TIMEFRAME)) TIMEFRAME = settings.TIMEFRAME;
-            if (VALID_VOLUMES_LOAD.includes(settings.VOLUME_THRESHOLD)) VOLUME_THRESHOLD = settings.VOLUME_THRESHOLD;
+            if (VALID_EMA_PERIODS.includes(settings.EMA_PERIOD)) EMA_PERIOD = settings.EMA_PERIOD;
+            if (VALID_TIMEFRAMES.includes(settings.TIMEFRAME)) TIMEFRAME = settings.TIMEFRAME;
+            if (VALID_VOLUMES.includes(settings.VOLUME_THRESHOLD)) VOLUME_THRESHOLD = settings.VOLUME_THRESHOLD;
             ML_ENABLED = settings.ML_ENABLED !== undefined ? settings.ML_ENABLED : ML_ENABLED;
             DUAL_EMA_MODE = settings.DUAL_EMA_MODE !== undefined ? settings.DUAL_EMA_MODE : DUAL_EMA_MODE;
 
@@ -2345,7 +2406,7 @@ function startWebSocketHeartbeat() {
                 if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
                     // Only log to file, not to console
                     fs.appendFileSync(
-                        path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+                        getDailyLogPath(),
                         `[${new Date().toISOString()}] WebSocket for ${symbol} is closed or closing. Reconnecting...\n`
                     );
                     setupSymbolWebSocket(symbol);
@@ -2356,14 +2417,14 @@ function startWebSocketHeartbeat() {
             if (reconnected > 0) {
                 // Only log to file, not to console
                 fs.appendFileSync(
-                    path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+                    getDailyLogPath(),
                     `[${new Date().toISOString()}] Reconnected ${reconnected} WebSocket connections during heartbeat check\n`
                 );
             }
         } catch (error) {
             // Only log to file, not to console
             fs.appendFileSync(
-                path.join(LOG_DIR, `ema-tracker-${new Date().toISOString().split('T')[0]}.log`),
+                getDailyLogPath(),
                 `[${new Date().toISOString()}] Error in WebSocket heartbeat: ${error.message}\n`
             );
         }
@@ -2522,7 +2583,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // // installRequiredPackages — COMMENTED OUT: not needed, packages are installed via npm
 // async function installRequiredPackages() { ... }
 
-// Calculate ATR (Average True Range)
+// Calculate ATR (Average True Range) using Wilder's smoothing
 function calculateATR(klines, period = 14) {
     if (klines.length < period + 1) {
         return null;
@@ -2548,8 +2609,11 @@ function calculateATR(klines, period = 14) {
         trueRanges.push(trueRange);
     }
 
-    // Calculate ATR as the average of the last 'period' true ranges
-    const atr = trueRanges.slice(-period).reduce((sum, tr) => sum + tr, 0) / period;
+    // Wilder's smoothed ATR: seed with SMA of first `period` TRs, then smooth
+    let atr = trueRanges.slice(0, period).reduce((sum, tr) => sum + tr, 0) / period;
+    for (let i = period; i < trueRanges.length; i++) {
+        atr = (atr * (period - 1) + trueRanges[i]) / period;
+    }
 
     return atr;
 }
@@ -2579,6 +2643,7 @@ async function initialize() {
         // Initialize terminal and load settings
         initializeTerminal();
         loadSettings();
+        loadAlertState(); // restore last-alert timestamps so restarts don't re-fire crossovers
         rotateLogs();
 
         // Register toast app so click-to-open works on Windows
@@ -2620,6 +2685,17 @@ async function initialize() {
         // Start WebSocket heartbeat
         startWebSocketHeartbeat();
 
+        // Periodically reset reconnection counters for maxed-out symbols and re-attempt
+        setInterval(() => {
+            for (const [symbol, attempts] of reconnectionAttempts.entries()) {
+                if (attempts >= MAX_RECONNECTION_ATTEMPTS && trackedPairs.has(symbol) && !activeWebSockets.has(symbol)) {
+                    log(`Resetting reconnection counter for ${symbol} and re-attempting...`, 'info');
+                    reconnectionAttempts.set(symbol, 0);
+                    setupSymbolWebSocket(symbol);
+                }
+            }
+        }, 5 * 60 * 1000); // every 5 minutes
+
         // Schedule model training if ML is enabled
         if (ML_ENABLED) {
             scheduleModelTraining();
@@ -2627,6 +2703,15 @@ async function initialize() {
 
         // Schedule periodic saving of training data
         setInterval(saveTrainingData, 30 * 60 * 1000); // Save every 30 minutes
+
+        // Process deferred updates (replaces unbounded 24h setTimeout timers)
+        setInterval(async () => {
+            const now = Date.now();
+            while (deferredUpdates.length > 0 && deferredUpdates[0].executeAt <= now) {
+                const task = deferredUpdates.shift();
+                try { await task.fn(); } catch (e) { log(`Deferred update error: ${e.message}`, 'error'); }
+            }
+        }, 60 * 1000); // check every minute
 
         // Now set flag to enable volume threshold notifications for subsequent checks
         initialLoadComplete = true;
