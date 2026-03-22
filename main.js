@@ -33,6 +33,10 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.error('Create a .env file or set them in your deployment platform, then restart.');
     process.exit(1);
 }
+if (!/^-?[0-9]+$/.test(TELEGRAM_CHAT_ID)) {
+    console.error('FATAL: TELEGRAM_CHAT_ID must be a numeric string (digits with optional leading minus).');
+    process.exit(1);
+}
 
 // Initialize Telegram bot with polling enabled
 // const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -100,6 +104,16 @@ function saveAlertState() {
 // Deferred update queue — replaces unbounded 24h setTimeout calls
 // Each entry: { executeAt: timestamp, fn: async () => ... }
 const deferredUpdates = [];
+// O(log n) sorted insert — keeps deferredUpdates in ascending executeAt order
+function deferredInsert(entry) {
+    let lo = 0, hi = deferredUpdates.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (deferredUpdates[mid].executeAt <= entry.executeAt) lo = mid + 1;
+        else hi = mid;
+    }
+    deferredUpdates.splice(lo, 0, entry);
+}
 
 // WebSocket related variables
 const activeWebSockets = new Map(); // Track active WebSocket connections
@@ -116,11 +130,35 @@ const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
 const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsaw
 // Validation constants — shared by settings loader and callback handler
-const VALID_VOLUMES    = [50_000_000, 100_000_000, 200_000_000];
+const VALID_VOLUMES    = [20_000_000, 50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
 let isReconnecting = false; // Prevents stacked reconnections during graceful restarts
 let monitoringInterval = null; // Reference to the periodic check interval
+
+// Prevent destructive commands from being spammed concurrently.
+const COMMAND_COOLDOWN_MS = 30 * 1000;
+const commandCooldown = new Map(); // command -> { running: boolean, lastRunAt: number }
+
+function beginCommand(command) {
+    const now = Date.now();
+    const state = commandCooldown.get(command);
+
+    if (state?.running) {
+        return { ok: false, reason: 'already-running' };
+    }
+
+    if (state && now - state.lastRunAt < COMMAND_COOLDOWN_MS) {
+        return { ok: false, reason: 'cooldown' };
+    }
+
+    commandCooldown.set(command, { running: true, lastRunAt: now });
+    return { ok: true };
+}
+
+function endCommand(command) {
+    commandCooldown.set(command, { running: false, lastRunAt: Date.now() });
+}
 
 // Telegram circuit breaker — pauses alert sends after 5 consecutive failures
 let _tgFailCount = 0;
@@ -146,7 +184,7 @@ async function safeSendAlert(chatId, text, opts) {
 // Build a TradingView chart URL for a given symbol (handles non-USDT pairs gracefully)
 function getTradingViewUrl(symbol) {
     const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
-    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USDT.P`;
+    return `https://www.tradingview.com/chart/?symbol=BYBIT:${base}USDT.P`;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -298,9 +336,9 @@ function showDesktopNotification(title, message, type = 'info', url = null) {
                         pipeServer.close();
                         const action = buf.toLowerCase();
                         if (action.includes('activate') || action.includes('clicked') || action.includes('buttonpressed')) {
-                            // Use PowerShell Start-Process for reliable URL opening even when URL has '&' characters
+                            // Use execFile (no shell) + PowerShell single-quote escaping to safely open URL
                             const psUrl = String(url).replace(/'/g, "''");
-                            exec(`powershell -NoProfile -Command "Start-Process '${psUrl}'"`, (err) => {
+                            execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', `Start-Process '${psUrl}'`], (err) => {
                                 if (err) log(`Failed to open browser: ${err.message}`, 'error');
                             });
                         }
@@ -334,10 +372,10 @@ function showDesktopNotification(title, message, type = 'info', url = null) {
 function initializeTerminal() {
     console.clear();
     console.log(figlet.textSync('EMA Tracker', { font: 'Standard' }).green);
-    console.log('Monitoring Binance Futures for EMA Crossovers'.yellow.bold);
+    console.log('Monitoring Bybit Futures for EMA Crossovers'.yellow.bold);
     console.log(`Configuration: ${DUAL_EMA_MODE ? 'EMA 9/15 Cross [5m+15m]' : EMA_PERIOD + ' EMA'} | ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME} Timeframe | Volume > ${VOLUME_THRESHOLD.toLocaleString()}`.cyan);
     console.log(`Alert Cooldown: ${ALERT_COOLDOWN / 60000} minutes`.magenta);
-    console.log(`Telegram Alerts: Enabled for Chat ID ${TELEGRAM_CHAT_ID}`.blue);
+    console.log(`Telegram Alerts: Enabled for Chat ID ${String(TELEGRAM_CHAT_ID).slice(0, 4)}****`.blue);
     console.log(`WebSocket Real-Time Monitoring: Enabled`.green);
     console.log(`Machine Learning: ${ML_ENABLED ? 'Enabled'.green : 'Disabled'.red}`);
     console.log('='.repeat(80).dim);
@@ -370,13 +408,14 @@ function formatPrice(price) {
 async function get24HrStats(symbol) {
     try {
         await enforceRateLimit();
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', {
-            params: { symbol },
+        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
+            params: { category: 'linear', symbol },
             timeout: 10000
         });
+        const ticker = response.data.result.list[0];
         return {
-            priceChangePercent: parseFloat(response.data.priceChangePercent).toFixed(2),
-            quoteVolume: parseFloat(response.data.quoteVolume)
+            priceChangePercent: (parseFloat(ticker.price24hPcnt) * 100).toFixed(2),
+            quoteVolume: parseFloat(ticker.turnover24h)
         };
     } catch (error) {
         log(`Error fetching 24hr stats for ${symbol}: ${error.message}`, 'error');
@@ -384,19 +423,28 @@ async function get24HrStats(symbol) {
     }
 }
 
-// Fetch Binance Futures pairs with 24hr quote volume above the threshold
+// Fetch Bybit Futures pairs with 24hr turnover above the threshold
 async function getFuturesPairs() {
     try {
         // Enforce rate limiting
         await enforceRateLimit();
-        
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', { timeout: 10000 });
+
+        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
+            params: { category: 'linear' },
+            timeout: 10000
+        });
+
+        const tickers = response.data.result.list;
         const newPairs = [];
 
-        const pairs = response.data
-            .filter(pair => {
-                const volume = parseFloat(pair.quoteVolume);
-                const symbol = pair.symbol;
+        const pairs = tickers
+            .filter(ticker => {
+                // Only USDT perpetuals — skip inverse contracts like BTCUSD
+                if (!ticker.symbol.endsWith('USDT')) return false;
+
+                // turnover24h is already in USDT — no price multiplication needed
+                const volume = parseFloat(ticker.turnover24h);
+                const symbol = ticker.symbol;
 
                 if (volume > VOLUME_THRESHOLD) {
                     // Only track new pairs that cross threshold after initial load
@@ -404,8 +452,8 @@ async function getFuturesPairs() {
                         newPairs.push({
                             symbol,
                             volume,
-                            price: parseFloat(pair.lastPrice),
-                            change: parseFloat(pair.priceChangePercent)
+                            price: parseFloat(ticker.lastPrice),
+                            change: parseFloat(ticker.price24hPcnt) * 100
                         });
                     }
                     trackedPairs.add(symbol);
@@ -413,7 +461,7 @@ async function getFuturesPairs() {
                 }
                 return false;
             })
-            .map(pair => pair.symbol);
+            .map(ticker => ticker.symbol);
 
         // Alert for new pairs that crossed the volume threshold (only after initial load)
         if (newPairs.length > 0) {
@@ -423,16 +471,12 @@ async function getFuturesPairs() {
         return pairs;
     } catch (error) {
         log(`Error fetching futures pairs: ${error.message}`, 'error');
-        
-        // Handle Binance rate-limit (429) and IP-ban (418) separately
+
         if (error.response && error.response.status === 429) {
-            log('Rate limited by Binance (429). Waiting 5 minutes before next call...', 'warning');
-            await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
-        } else if (error.response && error.response.status === 418) {
-            log('IP banned by Binance (418). Waiting 30 minutes before next call...', 'error');
-            await new Promise(resolve => setTimeout(resolve, 30 * 60 * 1000));
+            log('Rate limited by Bybit (429). Waiting 2 minutes before next call...', 'warning');
+            await new Promise(resolve => setTimeout(resolve, 2 * 60 * 1000));
         }
-        
+
         return [];
     }
 }
@@ -478,17 +522,27 @@ async function getKlines(symbol, tf = null) {
         const requiredPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
         const limit = requiredPeriod + 100;
 
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
-            params: { symbol, interval, limit },
+        // Convert timeframe string to Bybit's numeric interval format
+        const bybitInterval = interval
+            .replace('4h', '240')
+            .replace('1h', '60')
+            .replace('m', '');   // '5m'→'5', '15m'→'15'
+
+        const response = await axios.get('https://api.bybit.com/v5/market/kline', {
+            params: { category: 'linear', symbol, interval: bybitInterval, limit },
             timeout: 10000
         });
 
-        const klines = response.data.map(k => ({
-            time: k[0],
-            open: parseFloat(k[1]),
-            high: parseFloat(k[2]),
-            low: parseFloat(k[3]),
-            close: parseFloat(k[4]),
+        // Bybit response: { result: { list: [[ts,o,h,l,c,vol,turnover],...] } }
+        // list is NEWEST first — reverse so oldest is first (same order as Binance)
+        const raw = response.data.result.list.reverse();
+
+        const klines = raw.map(k => ({
+            time:   parseInt(k[0]),
+            open:   parseFloat(k[1]),
+            high:   parseFloat(k[2]),
+            low:    parseFloat(k[3]),
+            close:  parseFloat(k[4]),
             volume: parseFloat(k[5])
         }));
 
@@ -645,7 +699,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
         // Retry with simpler message if parse_mode might be the issue
         try {
             const simpleMessage = `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} SIGNAL: ${symbol} at ${formatPrice(price)}`;
-            await bot.sendMessage(TELEGRAM_CHAT_ID, simpleMessage);
+            await safeSendAlert(TELEGRAM_CHAT_ID, simpleMessage);
             log(`Sent simplified alert for ${symbol} after error`, 'warning');
         } catch (retryError) {
             log(`Failed to send even simplified message: ${retryError.message}`, 'error');
@@ -694,12 +748,8 @@ function setupSymbolWebSocket(symbol) {
         }
     }
 
-    // Create WebSocket URL based on mode
-    // Dual-TF mode: one multiplexed connection handles both 5m and 15m — zero extra connections
-    const wsSymbol = symbol.toLowerCase();
-    const wsUrl = DUAL_EMA_MODE
-        ? `wss://fstream.binance.com/stream?streams=${wsSymbol}@kline_5m/${wsSymbol}@kline_15m`
-        : `wss://fstream.binance.com/ws/${wsSymbol}@kline_${TIMEFRAME}`;
+    // Bybit uses a single connection endpoint — subscribe via JSON message on open
+    const wsUrl = 'wss://stream.bybit.com/v5/public/linear';
 
     try {
         const ws = new WebSocket(wsUrl);
@@ -710,19 +760,52 @@ function setupSymbolWebSocket(symbol) {
             // Reset reconnection attempts on successful connection
             reconnectionAttempts.set(symbol, 0);
             log(`WebSocket connected for ${symbol}`, 'success');
+
+            // Subscribe to kline streams for this symbol
+            if (DUAL_EMA_MODE) {
+                ws.send(JSON.stringify({
+                    op: 'subscribe',
+                    args: [`kline.5.${symbol}`, `kline.15.${symbol}`]
+                }));
+            } else {
+                // Convert timeframe string to Bybit interval number: '5m'→'5', '15m'→'15', '1h'→'60', '4h'→'240'
+                const bybitInterval = TIMEFRAME
+                    .replace('4h', '240')
+                    .replace('1h', '60')
+                    .replace('m', '');
+                ws.send(JSON.stringify({
+                    op: 'subscribe',
+                    args: [`kline.${bybitInterval}.${symbol}`]
+                }));
+            }
         });
 
         ws.on('message', (data) => {
             try {
                 const message = JSON.parse(data);
 
-                // Multiplexed streams wrap payload in { stream, data }; single streams don't
-                const payload = message.data || message;
-                if (payload.e !== 'kline') return;
+                // Bybit sends pong, subscription confirmations, etc — ignore them
+                if (!message.topic || !message.topic.startsWith('kline')) return;
 
-                const kline = payload.k;
-                // In dual-TF mode pass the actual interval ('5m'/'15m'); null for single-mode
-                const tf = DUAL_EMA_MODE ? kline.i : null;
+                const klineRaw   = message.data[0];
+                const topicParts = message.topic.split('.'); // ['kline','5','BTCUSDT']
+                const intervalStr = topicParts[1];            // '5' or '15'
+
+                // Map Bybit field names to the shape processClosedCandle already expects
+                const kline = {
+                    t: klineRaw.start,    // open time in ms
+                    o: klineRaw.open,
+                    h: klineRaw.high,
+                    l: klineRaw.low,
+                    c: klineRaw.close,
+                    v: klineRaw.volume,
+                    x: klineRaw.confirm   // confirm=true means closed candle
+                };
+
+                // In dual-TF mode derive tf from the topic interval; null for single-mode
+                const tf = DUAL_EMA_MODE
+                    ? (intervalStr === '5' ? '5m' : '15m')
+                    : null;
 
                 // Only process if the candle is closed
                 if (kline.x === true) {
@@ -771,6 +854,13 @@ function setupSymbolWebSocket(symbol) {
 
         // Store the WebSocket connection
         activeWebSockets.set(symbol, ws);
+
+        // Pre-create the ML data dir for this symbol so saveDataPoint never needs
+        // to call existsSync or mkdirSync on the hot candle-close path.
+        if (ML_ENABLED) {
+            const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+            fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
+        }
 
         // Initialize with historical data — seed both TFs in dual mode
         if (DUAL_EMA_MODE) {
@@ -846,7 +936,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 const a9  = offset > 0 ? e9.slice(offset)  : e9;
                 const a15 = offset < 0 ? e15.slice(-offset) : e15;
 
-                checkForDualEmaCrossover(
+                await checkForDualEmaCrossover(
                     symbol,
                     a9.at(-2), a9.at(-1),
                     a15.at(-2), a15.at(-1),
@@ -868,7 +958,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 const prevPrice = closes[closes.length - 2];
                 const lastEMA = emaValues[emaValues.length - 1];
                 const prevEMA = emaValues[emaValues.length - 2];
-                checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA);
+                await checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA);
             }
         }
 
@@ -886,6 +976,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
 
             // Calculate ATR
             const atr = calculateATR(klines);
+            const atrValid = klines.length >= 15;
 
             // Create feature vector
             const dataPoint = {
@@ -907,6 +998,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 bb_lower: bb.lower[bb.lower.length - 1],
                 bb_width: (bb.upper[bb.upper.length - 1] - bb.lower[bb.lower.length - 1]) / bb.middle[bb.middle.length - 1],
                 atr: atr,
+                atr_valid: atrValid,
                 volume_change: volumes.length > 1 ? volumes[volumes.length - 1] / volumes[volumes.length - 2] - 1 : 0,
                 // Target variable (to be filled later)
                 future_price_change: null,
@@ -935,8 +1027,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
             }
 
             // Schedule update of future price change (after 24 hours)
-            deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, kline.t) });
-            deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
+            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, kline.t) });
             // Safety cap — oldest entries are stale beyond 24 h; discard if queue grows unexpectedly
             if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
         }
@@ -948,40 +1039,20 @@ async function processClosedCandle(symbol, kline, tf = null) {
 // Save data point to JSON file
 async function saveDataPoint(symbol, dataPoint) {
     try {
-        // Create directory for this symbol if it doesn't exist
-        const symbolDir = path.join(ML_DATA_DIR, symbol);
-        if (!fs.existsSync(symbolDir)) {
-            fs.mkdirSync(symbolDir, { recursive: true });
-        }
+        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+        const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
 
-        // Use current month for filename to organize data
+        // Use current month for filename to organize data.
+        // Write as NDJSON (one JSON object per line) so each candle is a single
+        // async append — no read-modify-write cycle, no blocking existsSync.
         const date = new Date();
-        const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.json`;
+        const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.ndjson`;
         const filePath = path.join(symbolDir, filename);
 
-        // Load existing data or create new array (async — won't block the event loop)
-        let data = [];
-        if (fs.existsSync(filePath)) {
-            try {
-                data = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
-            } catch (e) {
-                log(`Error reading data file for ${symbol}: ${e.message}`, 'error');
-                data = [];
-            }
-        }
-
-        // Add new data point
-        data.push(dataPoint);
-
-        // Save data back to file asynchronously to avoid blocking the event loop
-        fs.writeFile(filePath, JSON.stringify(data, null, 2), (err) => {
-            if (err) log(`Error writing data file for ${symbol}: ${err.message}`, 'error');
-        });
-
-        // Only log occasionally to avoid excessive logging
-        if (data.length % 100 === 0) {
-            log(`Collected ${data.length} data points for ${symbol} (${filename})`, 'info');
-        }
+        // Dir is pre-created at WebSocket setup time (setupSymbolWebSocket) but
+        // we create it defensively here in case ML was enabled after initial setup.
+        await fs.promises.mkdir(symbolDir, { recursive: true });
+        await fs.promises.appendFile(filePath, JSON.stringify(dataPoint) + '\n');
 
         return true;
     } catch (error) {
@@ -1016,6 +1087,7 @@ function getCsvWriter(csvPath) {
                 { id: 'bb_lower', title: 'BB_LOWER' },
                 { id: 'bb_width', title: 'BB_WIDTH' },
                 { id: 'atr', title: 'ATR' },
+                { id: 'atr_valid', title: 'ATR_VALID' },
                 { id: 'volume_change', title: 'VOLUME_CHANGE' },
                 { id: 'future_price_change', title: 'FUTURE_PRICE_CHANGE' },
                 { id: 'label', title: 'LABEL' }
@@ -1032,15 +1104,16 @@ function exportToCSV(symbol) {
         }
 
         const data = trainingData.get(symbol);
+        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
 
         // Create directory for this symbol if it doesn't exist
-        const symbolDir = path.join(CSV_DATA_DIR, symbol);
+        const symbolDir = path.join(CSV_DATA_DIR, safeSymbol);
         if (!fs.existsSync(symbolDir)) {
             fs.mkdirSync(symbolDir, { recursive: true });
         }
 
         // Create CSV file path
-        const csvPath = path.join(symbolDir, `${symbol}_training_data.csv`);
+        const csvPath = path.join(symbolDir, `${safeSymbol}_training_data.csv`);
 
         // Define CSV writer (cached per path — avoids re-allocation on every call)
         const csvWriter = getCsvWriter(csvPath);
@@ -1175,17 +1248,22 @@ async function updateFuturePriceChange(symbol, timestamp) {
 // Update a stored data point in JSON files
 async function updateStoredDataPoint(symbol, timestamp, priceChange) {
     try {
+        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
         // Find the file containing this timestamp
-        const symbolDir = path.join(ML_DATA_DIR, symbol);
+        const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
         if (!fs.existsSync(symbolDir)) {
             return false;
         }
 
-        const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json'));
+        const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json') || f.endsWith('.ndjson'));
 
         for (const file of files) {
             const filePath = path.join(symbolDir, file);
-            const data = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+            const isNdjson = file.endsWith('.ndjson');
+            const raw = await fs.promises.readFile(filePath, 'utf8');
+            const data = isNdjson
+                ? raw.split('\n').filter(Boolean).map(line => JSON.parse(line))
+                : JSON.parse(raw);
 
             // Find the data point with matching timestamp
             const index = data.findIndex(d => d.timestamp === timestamp);
@@ -1195,7 +1273,10 @@ async function updateStoredDataPoint(symbol, timestamp, priceChange) {
                 data[index].label = priceChange > 1.0 ? 2 : priceChange < -1.0 ? 0 : 1;
 
                 // Save the updated data asynchronously
-                fs.writeFile(filePath, JSON.stringify(data, null, 2), (err) => {
+                const updated = isNdjson
+                    ? data.map(d => JSON.stringify(d)).join('\n') + '\n'
+                    : JSON.stringify(data, null, 2);
+                fs.writeFile(filePath, updated, (err) => {
                     if (err) log(`Error writing updated data for ${symbol}: ${err.message}`, 'error');
                 });
                 return true;
@@ -1213,11 +1294,11 @@ async function updateStoredDataPoint(symbol, timestamp, priceChange) {
 async function getCurrentPrice(symbol) {
     try {
         await enforceRateLimit();
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/price', {
-            params: { symbol },
+        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
+            params: { category: 'linear', symbol },
             timeout: 10000
         });
-        return parseFloat(response.data.price);
+        return parseFloat(response.data.result.list[0].lastPrice);
     } catch (error) {
         log(`Error getting current price for ${symbol}: ${error.message}`, 'error');
         throw error;
@@ -1382,7 +1463,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
         try {
             const tfLabel = tf ? ` [${tf.toUpperCase()}]` : '';
             const simpleMsg = `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} EMA 9/15 CROSS${tfLabel}: ${symbol} at ${formatPrice(price)}`;
-            await bot.sendMessage(TELEGRAM_CHAT_ID, simpleMsg);
+            await safeSendAlert(TELEGRAM_CHAT_ID, simpleMsg);
         } catch (retryError) {
             log(`Failed to send even simplified dual EMA message: ${retryError.message}`, 'error');
         }
@@ -1446,8 +1527,7 @@ async function predictPriceMovement(symbol, price, ema, emaDiff) {
             }
 
             // Schedule accuracy update
-            deferredUpdates.push({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateModelAccuracy(symbol, price, prediction) });
-            deferredUpdates.sort((a, b) => a.executeAt - b.executeAt);
+            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateModelAccuracy(symbol, price, prediction) });
             // Safety cap — mirrors the cap in processClosedCandle
             if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
         }
@@ -1515,6 +1595,22 @@ async function setupAllWebSockets() {
                     // Ignore errors when closing
                 }
                 activeWebSockets.delete(symbol);
+                trackedPairs.delete(symbol);
+
+                // Evict stale per-symbol CSV writer to avoid unbounded cache growth.
+                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
+                csvWriterCache.delete(csvPath);
+            }
+        }
+
+        // Also prune stale tracked symbols that no longer have active sockets.
+        for (const symbol of Array.from(trackedPairs)) {
+            if (!pairs.includes(symbol)) {
+                trackedPairs.delete(symbol);
+                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
+                csvWriterCache.delete(csvPath);
             }
         }
 
@@ -1545,7 +1641,7 @@ async function setupAllWebSockets() {
 // Fetch REST promises in small batches to avoid saturating enforceRateLimit.
 // Without chunking, a concurrent Promise.all on 80+ getKlines calls all read the
 // same lastApiCall timestamp in the same millisecond — effectively bypassing the
-// rate limiter and triggering Binance 429s which cause a 5-minute backoff stall.
+// rate limiter and triggering Bybit 429s which cause a backoff stall.
 async function fetchInChunks(promises, chunkSize = 8, delayMs = 1500) {
     const results = [];
     for (let i = 0; i < promises.length; i += chunkSize) {
@@ -1584,13 +1680,15 @@ async function checkEMACross() {
             }
             results = await fetchInChunks(dualPromises);
         } else {
-            results = await Promise.all(
-                pairs.map(pair =>
-                    getKlines(pair)
-                        .then(klines => ({ pair, tf: null, klines, error: null }))
-                        .catch(error => ({ pair, tf: null, klines: [], error }))
-                )
+            // Single-mode: use the same chunked fetcher as dual-mode so all 80+
+            // getKlines calls don't race to read the same lastApiCall timestamp,
+            // bypassing enforceRateLimit and triggering Bybit 429s.
+            const singlePromises = pairs.map(pair =>
+                getKlines(pair)
+                    .then(klines => ({ pair, tf: null, klines, error: null }))
+                    .catch(error => ({ pair, tf: null, klines: [], error }))
             );
+            results = await fetchInChunks(singlePromises);
         }
 
         for (let i = 0; i < results.length; i++) {
@@ -1623,7 +1721,7 @@ async function checkEMACross() {
                 const a15 = _offset < 0 ? e15.slice(-_offset) : e15;
 
                 const closes = klines.map(k => k.close);
-                checkForDualEmaCrossover(
+                await checkForDualEmaCrossover(
                     pair,
                     a9.at(-2), a9.at(-1),
                     a15.at(-2), a15.at(-1),
@@ -1644,7 +1742,7 @@ async function checkEMACross() {
                 const prevPrice = closes[closes.length - 2];
                 const prevEMA = ema[ema.length - 2];
 
-                checkForCrossover(pair, prevPrice, lastPrice, prevEMA, lastEMA);
+                await checkForCrossover(pair, prevPrice, lastPrice, prevEMA, lastEMA);
             }
         }
 
@@ -1665,7 +1763,8 @@ function saveTrainingData() {
         // Save each symbol's data
         for (const [symbol, data] of trainingData.entries()) {
             // Save to JSON
-            const symbolDir = path.join(ML_DATA_DIR, symbol);
+            const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+            const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
             if (!fs.existsSync(symbolDir)) {
                 fs.mkdirSync(symbolDir, { recursive: true });
             }
@@ -1712,14 +1811,22 @@ function loadTrainingData() {
 
         for (const symbol of symbols) {
             const symbolDir = path.join(ML_DATA_DIR, symbol);
-            const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json'));
+            const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json') || f.endsWith('.ndjson'));
 
             let symbolData = [];
 
             for (const file of files) {
                 try {
                     const filePath = path.join(symbolDir, file);
-                    const fileData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                    let fileData;
+                    if (file.endsWith('.ndjson')) {
+                        fileData = fs.readFileSync(filePath, 'utf8')
+                            .split('\n')
+                            .filter(Boolean)
+                            .map(line => JSON.parse(line));
+                    } else {
+                        fileData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                    }
                     symbolData = symbolData.concat(fileData);
                 } catch (error) {
                     log(`Error loading data file ${file} for ${symbol}: ${error.message}`, 'warning');
@@ -1901,16 +2008,17 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
         log(`Error sending ML-enhanced Telegram message: ${error.message}`, 'error');
 
         // Fall back to regular alert
-        sendTelegramAlert(symbol, crossType, price, ema, difference);
+        await sendTelegramAlert(symbol, crossType, price, ema, difference)
+            .catch(e => log(`Fallback alert failed for ${symbol}: ${e.message}`, 'error'));
     }
 }
 
 // Command handler
-function handleMessage(msg) {
+async function handleMessage(msg) {
     const chatId = msg.chat.id;
 
     // Authorization: only the configured owner may control this bot
-    if (String(chatId) !== String(TELEGRAM_CHAT_ID)) {
+    if (chatId.toString() !== TELEGRAM_CHAT_ID) {
         bot.sendMessage(chatId, '⛔ Unauthorized.').catch(() => {});
         log(`Unauthorized access attempt from chatId ${chatId}`, 'warning');
         return;
@@ -1931,9 +2039,27 @@ function handleMessage(msg) {
     } else if (msg.text === '/mlstatus') {
         sendModelPerformance(chatId);
     } else if (msg.text === '/train') {
-        trainAllModels(chatId);
+        const guard = beginCommand('/train');
+        if (!guard.ok) {
+            await bot.sendMessage(chatId, '⚠️ /train is already running or cooling down. Please wait.').catch(() => {});
+            return;
+        }
+        try {
+            await trainAllModels(chatId);
+        } finally {
+            endCommand('/train');
+        }
     } else if (msg.text === '/collectdata') {
-        startManualDataCollection(chatId);
+        const guard = beginCommand('/collectdata');
+        if (!guard.ok) {
+            await bot.sendMessage(chatId, '⚠️ /collectdata is already running or cooling down. Please wait.').catch(() => {});
+            return;
+        }
+        try {
+            await startManualDataCollection(chatId);
+        } finally {
+            endCommand('/collectdata');
+        }
     } else if (msg.text === '/exportcsv') {
         exportAllDataToCSV();
         bot.sendMessage(chatId, '📊 All training data exported to CSV format successfully!');
@@ -2079,7 +2205,7 @@ async function handleCallbackQuery(callbackQuery) {
     const chatId = callbackQuery.message.chat.id;
 
     // Authorization: silently reject callbacks from anyone other than the owner
-    if (String(chatId) !== String(TELEGRAM_CHAT_ID)) {
+    if (chatId.toString() !== TELEGRAM_CHAT_ID) {
         await bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ Unauthorized.' }).catch(() => {});
         log(`Unauthorized callback attempt from chatId ${chatId}`, 'warning');
         return;
@@ -2163,7 +2289,16 @@ async function handleCallbackQuery(callbackQuery) {
         } else if (action === 'ml_status') {
             await sendModelPerformance(chatId);
         } else if (action === 'train_models') {
-            await trainAllModels(chatId);
+            const guard = beginCommand('/train');
+            if (!guard.ok) {
+                await bot.sendMessage(chatId, '⚠️ /train is already running or cooling down. Please wait.').catch(() => {});
+            } else {
+                try {
+                    await trainAllModels(chatId);
+                } finally {
+                    endCommand('/train');
+                }
+            }
         } else if (action === 'toggle_ml') {
             ML_ENABLED = !ML_ENABLED;
             saveSettings();
@@ -2211,7 +2346,29 @@ function loadSettings() {
     try {
         const settingsPath = path.join(__dirname, 'settings.json');
         if (fs.existsSync(settingsPath)) {
-            const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Invalid settings format: expected a JSON object');
+            }
+
+            const allowedKeys = new Set([
+                'EMA_PERIOD',
+                'TIMEFRAME',
+                'VOLUME_THRESHOLD',
+                'CHECK_INTERVAL',
+                'ALERT_COOLDOWN',
+                'ML_ENABLED',
+                'DUAL_EMA_MODE'
+            ]);
+
+            for (const key of Object.keys(parsed)) {
+                if (!allowedKeys.has(key)) {
+                    throw new Error(`Unknown settings key: ${key}`);
+                }
+            }
+
+            // Clone to a plain data object so inherited/prototype properties are ignored.
+            const settings = Object.assign(Object.create(null), parsed);
 
             // Update variables with saved settings (whitelist-validated to prevent corrupted settings file)
             if (VALID_EMA_PERIODS.includes(settings.EMA_PERIOD)) EMA_PERIOD = settings.EMA_PERIOD;
@@ -2312,7 +2469,10 @@ async function sendSettingsMenu(chatId) {
                 { text: `EMA 9/15 Cross: ${DUAL_EMA_MODE ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_dual_ema' }
             ],
             [
-                { text: 'Vol 50M', callback_data: 'volume_50000000' },
+                { text: 'Vol 20M', callback_data: 'volume_20000000' },
+                { text: 'Vol 50M', callback_data: 'volume_50000000' }
+            ],
+            [
                 { text: 'Vol 100M', callback_data: 'volume_100000000' },
                 { text: 'Vol 200M', callback_data: 'volume_200000000' }
             ],
@@ -2336,7 +2496,7 @@ async function sendSettingsMenu(chatId) {
 // Send help message
 async function sendHelpMessage(chatId) {
     const helpText = `*EMA Tracker Bot Help*\n\n` +
-        `This bot monitors Binance Futures markets for EMA crossovers and sends alerts when they occur.\n\n` +
+        `This bot monitors Bybit Futures markets for EMA crossovers and sends alerts when they occur.\n\n` +
         `*Available Commands:*\n` +
         `/menu - Show the main menu\n` +
         `/status - Check bot status\n` +
@@ -2369,18 +2529,21 @@ async function sendTopPerformers(chatId, type = 'gainers') {
         await bot.sendMessage(chatId, '⏳ Fetching data...');
 
         await enforceRateLimit();
-        const response = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', { timeout: 10000 });
-        let coins = response.data.filter(coin => coin.symbol.endsWith('USDT'));
+        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
+            params: { category: 'linear' },
+            timeout: 10000
+        });
+        let coins = response.data.result.list.filter(coin => coin.symbol.endsWith('USDT'));
 
         // Sort based on type
         if (type === 'gainers') {
-            coins.sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent));
+            coins.sort((a, b) => parseFloat(b.price24hPcnt) - parseFloat(a.price24hPcnt));
             coins = coins.slice(0, 10); // Top 10 gainers
         } else if (type === 'losers') {
-            coins.sort((a, b) => parseFloat(a.priceChangePercent) - parseFloat(b.priceChangePercent));
+            coins.sort((a, b) => parseFloat(a.price24hPcnt) - parseFloat(b.price24hPcnt));
             coins = coins.slice(0, 10); // Top 10 losers
         } else if (type === 'volume') {
-            coins.sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
+            coins.sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h));
             coins = coins.slice(0, 10); // Top 10 by volume
         }
 
@@ -2394,8 +2557,8 @@ async function sendTopPerformers(chatId, type = 'gainers') {
         coins.forEach((coin, index) => {
             const symbol = coin.symbol;
             const price = formatPrice(parseFloat(coin.lastPrice));
-            const change = parseFloat(coin.priceChangePercent).toFixed(2);
-            const volume = formatVolume(parseFloat(coin.quoteVolume));
+            const change = (parseFloat(coin.price24hPcnt) * 100).toFixed(2);
+            const volume = formatVolume(parseFloat(coin.turnover24h));
 
             const changeEmoji = parseFloat(change) >= 0 ? '🟢' : '🔴';
             message += `${index + 1}. ${symbol}: ${price} (${changeEmoji} ${change}%) - Vol: ${volume}\n`;
@@ -2555,9 +2718,8 @@ function startWebSocketHeartbeat() {
         }
     }, 60000); // Check every minute
 
-    // Binance drops idle streams after ~10 minutes if no data or ping is received.
-    // Sending a ping frame every 3 minutes keeps every connection alive and also
-    // lets us detect dead connections sooner than waiting for readyState to flip.
+    // TCP-level ping every 3 minutes keeps every connection alive and detects dead
+    // connections sooner than waiting for readyState to flip.
     setInterval(() => {
         for (const [symbol, ws] of activeWebSockets.entries()) {
             if (ws.readyState === WebSocket.OPEN) {
@@ -2565,6 +2727,15 @@ function startWebSocketHeartbeat() {
             }
         }
     }, 3 * 60 * 1000);
+
+    // Bybit requires an application-level JSON ping every 20 seconds or it drops the connection
+    setInterval(() => {
+        for (const [symbol, ws] of activeWebSockets.entries()) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ op: 'ping' }));
+            }
+        }
+    }, 20 * 1000);
 }
 
 // Schedule periodic model training
@@ -2687,7 +2858,10 @@ async function gracefulShutdown(signal) {
         // Flush alert state so cooldowns and coin states survive the restart
         saveAlertState();
 
-        await bot.sendMessage(TELEGRAM_CHAT_ID, '⚠️ EMA Tracker Bot is shutting down...');
+        await Promise.race([
+            bot.sendMessage(TELEGRAM_CHAT_ID, '⚠️ EMA Tracker Bot is shutting down...'),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown message timeout')), 3000))
+        ]).catch(() => {});
 
         // Show desktop notification
         showDesktopNotification(
@@ -2725,7 +2899,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // Calculate ATR (Average True Range) using Wilder's smoothing
 function calculateATR(klines, period = 14) {
     if (klines.length < period + 1) {
-        return null;
+        return 0;
     }
 
     const trueRanges = [];
@@ -2818,6 +2992,11 @@ async function initialize() {
         // Do initial check to populate data
         await checkEMACross();
 
+        // Mark initial load complete before WebSocket/interval registration so
+        // periodic tasks never run with stale startup state.
+        initialLoadComplete = true;
+        log('Initial load complete. Volume threshold notifications enabled for new pairs.', 'info');
+
         // Setup WebSockets for all tracked pairs
         await setupAllWebSockets();
 
@@ -2851,10 +3030,6 @@ async function initialize() {
                 try { await task.fn(); } catch (e) { log(`Deferred update error: ${e.message}`, 'error'); }
             }
         }, 60 * 1000); // check every minute
-
-        // Now set flag to enable volume threshold notifications for subsequent checks
-        initialLoadComplete = true;
-        log('Initial load complete. Volume threshold notifications enabled for new pairs.', 'info');
 
         // Run the check at the specified interval as a backup
         // This is in addition to the real-time WebSocket monitoring
