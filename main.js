@@ -11,6 +11,8 @@ const notifier = require('node-notifier');
 const WebSocket = require('ws');
 const { createObjectCsvWriter } = require('csv-writer');
 const http = require('http');
+const DELTA_REST_BASE_URL = 'https://api.india.delta.exchange/v2';
+const DELTA_PUBLIC_WS_URL = 'wss://public-socket.india.delta.exchange';
 
 let initialLoadComplete = false;
 let lastCandleTime = null; // Timestamp of the most recently processed closed candle
@@ -19,6 +21,8 @@ let ML_ENABLED = false;
 
 // Dual EMA crossover mode: when true, alerts on EMA(9) vs EMA(15) crossover instead of price vs single EMA
 let DUAL_EMA_MODE = false;
+// Optional fast timeframe addon for dual mode: include 1m+3m alongside 5m+15m
+let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'false').toLowerCase() === 'true';
 
 // Configuration
 let EMA_PERIOD = parseInt(process.env.EMA_PERIOD, 10) || 200;
@@ -126,6 +130,8 @@ const klineCache = new Map(); // Cache for kline data
 const emaCache = new Map(); // Cache for calculated EMAs
 const ema9Cache = new Map(); // Cache for EMA(9) values (dual mode)
 const ema15Cache = new Map(); // Cache for EMA(15) values (dual mode)
+const lastWsCandleTs = new Map(); // Guard against duplicate candlestick events per symbol/tf
+const oiSnapshotCache = new Map(); // Cache latest OI per symbol for delta calculation
 // Composite cache key for dual-TF mode — "BTCUSDT_5m" / "BTCUSDT_15m"
 function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
 const trainingData = new Map(); // Store historical data for ML training
@@ -133,11 +139,11 @@ const modelPerformance = new Map(); // Track ML model accuracy
 const reconnectionAttempts = new Map(); // Track reconnection attempts (keyed by pool index: "pool_0", "pool_1", …)
 const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
-const WS_TOPICS_PER_CONN = 100;  // Bybit allows ~500 topics/conn; stay well within limits
+const WS_TOPICS_PER_CONN = 100;  // Keep pool size conservative for stable public WS usage
 const wsPool = [];                // [{ ws, symbols: Set<string>, index }]
 const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsaw
 // Validation constants — shared by settings loader and callback handler
-const VALID_VOLUMES    = [20_000_000, 50_000_000, 100_000_000, 200_000_000];
+const VALID_VOLUMES    = [5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
 let isReconnecting = false; // Prevents stacked reconnectionsduring graceful restarts
@@ -196,8 +202,19 @@ function getTradingViewUrl(symbol) {
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
 function activeTimeframeLabel(tf = '') {
-    if (DUAL_EMA_MODE) return tf ? tf.toUpperCase() : '5m + 15m';
+    if (DUAL_EMA_MODE) return tf ? tf.toUpperCase() : getDualEmaTimeframes().join(' + ');
     return TIMEFRAME;
+}
+// Central source of truth for dual-mode timeframe set.
+function getDualEmaTimeframes() {
+    return INCLUDE_FAST_TFS ? ['1m', '3m', '5m', '15m'] : ['5m', '15m'];
+}
+function timeframeToSeconds(tf) {
+    const map = {
+        '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+        '1h': 3600, '2h': 7200, '4h': 14400, '6h': 21600, '12h': 43200, '1d': 86400
+    };
+    return map[tf] || 300;
 }
 let _indicatorsModule = null; // Cached module ref — avoids repeated require() on every closed candle
 // Rate limiting for API calls
@@ -380,8 +397,8 @@ function showDesktopNotification(title, message, type = 'info', url = null) {
 function initializeTerminal() {
     console.clear();
     console.log(figlet.textSync('EMA Tracker', { font: 'Standard' }).green);
-    console.log('Monitoring Bybit Futures for EMA Crossovers'.yellow.bold);
-    console.log(`Configuration: ${DUAL_EMA_MODE ? 'EMA 9/15 Cross [5m+15m]' : EMA_PERIOD + ' EMA'} | ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME} Timeframe | Volume > ${VOLUME_THRESHOLD.toLocaleString()}`.cyan);
+    console.log('Monitoring Delta Exchange Futures for EMA Crossovers'.yellow.bold);
+    console.log(`Configuration: ${DUAL_EMA_MODE ? `EMA 9/15 Cross [${getDualEmaTimeframes().join('+')}]` : EMA_PERIOD + ' EMA'} | ${DUAL_EMA_MODE ? getDualEmaTimeframes().join(' + ') : TIMEFRAME} Timeframe | Volume > ${VOLUME_THRESHOLD.toLocaleString()}`.cyan);
     console.log(`Alert Cooldown: ${ALERT_COOLDOWN / 60000} minutes`.magenta);
     console.log(`Telegram Alerts: Enabled for Chat ID ${String(TELEGRAM_CHAT_ID).slice(0, 4)}****`.blue);
     console.log(`WebSocket Real-Time Monitoring: Enabled`.green);
@@ -389,7 +406,7 @@ function initializeTerminal() {
     console.log('='.repeat(80).dim);
     console.log('\nCROSSOVER EVENTS:'.cyan.bold);
 
-    log(`EMA Tracker started with configuration: Mode=${DUAL_EMA_MODE ? 'EMA9/15[5m+15m]' : 'EMA' + EMA_PERIOD}, Timeframe=${DUAL_EMA_MODE ? '5m+15m' : TIMEFRAME}, Volume Threshold=${VOLUME_THRESHOLD}, ML=${ML_ENABLED}`);
+    log(`EMA Tracker started with configuration: Mode=${DUAL_EMA_MODE ? `EMA9/15[${getDualEmaTimeframes().join('+')}]` : 'EMA' + EMA_PERIOD}, Timeframe=${DUAL_EMA_MODE ? getDualEmaTimeframes().join('+') : TIMEFRAME}, Volume Threshold=${VOLUME_THRESHOLD}, ML=${ML_ENABLED}`);
 }
 
 // Helper function to format volume
@@ -416,14 +433,14 @@ function formatPrice(price) {
 async function get24HrStats(symbol) {
     try {
         await enforceRateLimit();
-        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
-            params: { category: 'linear', symbol },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers/${symbol}`, {
             timeout: 10000
         });
-        const ticker = response.data.result.list[0];
+        const ticker = response?.data?.result;
+        if (!ticker) throw new Error(`Ticker not found for ${symbol}`);
         return {
-            priceChangePercent: (parseFloat(ticker.price24hPcnt) * 100).toFixed(2),
-            quoteVolume: parseFloat(ticker.turnover24h)
+            priceChangePercent: parseFloat(ticker.ltp_change_24h || 0).toFixed(2),
+            quoteVolume: parseFloat(ticker.turnover_usd || ticker.turnover || 0)
         };
     } catch (error) {
         log(`Error fetching 24hr stats for ${symbol}: ${error.message}`, 'error');
@@ -431,27 +448,26 @@ async function get24HrStats(symbol) {
     }
 }
 
-// Fetch Bybit Futures pairs with 24hr turnover above the threshold
+// Fetch Delta perpetual futures pairs with 24hr turnover above threshold
 async function getFuturesPairs() {
     try {
         // Enforce rate limiting
         await enforceRateLimit();
 
-        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
-            params: { category: 'linear' },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers`, {
+            params: { contract_types: 'perpetual_futures' },
             timeout: 10000
         });
 
-        const tickers = response.data.result.list;
+        const tickers = response?.data?.result;
+        if (!Array.isArray(tickers)) throw new Error('Unexpected Delta tickers response shape');
         const newPairs = [];
 
         const pairs = tickers
             .filter(ticker => {
-                // Only USDT perpetuals — skip inverse contracts like BTCUSD
-                if (!ticker.symbol.endsWith('USDT')) return false;
+                if (ticker.contract_type !== 'perpetual_futures') return false;
 
-                // turnover24h is already in USDT — no price multiplication needed
-                const volume = parseFloat(ticker.turnover24h);
+                const volume = parseFloat(ticker.turnover_usd || ticker.turnover || 0);
                 const symbol = ticker.symbol;
 
                 if (volume > VOLUME_THRESHOLD) {
@@ -460,8 +476,8 @@ async function getFuturesPairs() {
                         newPairs.push({
                             symbol,
                             volume,
-                            price: parseFloat(ticker.lastPrice),
-                            change: parseFloat(ticker.price24hPcnt) * 100
+                            price: parseFloat(ticker.close || 0),
+                            change: parseFloat(ticker.ltp_change_24h || 0)
                         });
                     }
                     trackedPairs.add(symbol);
@@ -481,7 +497,7 @@ async function getFuturesPairs() {
         log(`Error fetching futures pairs: ${error.message}`, 'error');
 
         if (error.response && error.response.status === 429) {
-            log('Rate limited by Bybit (429). Waiting 2 minutes before next call...', 'warning');
+            log('Rate limited by Delta (429). Waiting 2 minutes before next call...', 'warning');
             await new Promise(resolve => setTimeout(resolve, 2 * 60 * 1000));
         }
 
@@ -530,34 +546,29 @@ async function getKlines(symbol, tf = null) {
         const requiredPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
         const limit = requiredPeriod + 100;
 
-        // Convert timeframe string to Bybit's numeric interval format
-        const bybitInterval = interval
-            .replace('4h', '240')
-            .replace('1h', '60')
-            .replace('m', '');   // '5m'→'5', '15m'→'15'
+        const end = Math.floor(Date.now() / 1000);
+        const start = end - (timeframeToSeconds(interval) * (limit + 5));
 
-        const response = await axios.get('https://api.bybit.com/v5/market/kline', {
-            params: { category: 'linear', symbol, interval: bybitInterval, limit },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/history/candles`, {
+            params: { resolution: interval, symbol, start, end },
             timeout: 10000
         });
 
-        // Bybit response: { result: { list: [[ts,o,h,l,c,vol,turnover],...] } }
-        // list is NEWEST first — reverse so oldest is first (same order as Binance)
-        const list = response.data?.result?.list;
+        const list = response.data?.result;
         if (!Array.isArray(list) || list.length === 0) {
-            log(`Empty kline response for ${symbol} [${interval}] — Bybit may be rate-limiting`, 'warning');
+            log(`Empty kline response for ${symbol} [${interval}] — Delta may be rate-limiting`, 'warning');
             return [];
         }
-        const raw = list.reverse();
+        const raw = list;
 
         const klines = raw.map(k => ({
-            time:   parseInt(k[0]),
-            open:   parseFloat(k[1]),
-            high:   parseFloat(k[2]),
-            low:    parseFloat(k[3]),
-            close:  parseFloat(k[4]),
-            volume: parseFloat(k[5])
-        }));
+            time:   parseInt(k.time, 10) * 1000,
+            open:   parseFloat(k.open),
+            high:   parseFloat(k.high),
+            low:    parseFloat(k.low),
+            close:  parseFloat(k.close),
+            volume: parseFloat(k.volume || 0)
+        })).sort((a, b) => a.time - b.time);
 
         // Use composite key when tf is explicitly provided (dual-TF mode)
         const cacheKey = tf ? tfKey(symbol, tf) : symbol;
@@ -673,14 +684,15 @@ function updateDualEMA(key, newClose) {
 async function getOIDelta(symbol) {
     try {
         await enforceRateLimit();
-        const response = await axios.get('https://api.bybit.com/v5/market/open-interest', {
-            params: { category: 'linear', symbol, intervalTime: '5min', limit: 2 },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers/${symbol}`, {
             timeout: 8000
         });
-        const list = response.data?.result?.list;
-        if (!list || list.length < 2) return null;
-        const oiNow  = parseFloat(list[0].openInterest);
-        const oiPrev = parseFloat(list[1].openInterest);
+        const ticker = response?.data?.result;
+        if (!ticker) return null;
+        const oiNow = parseFloat(ticker.oi_value_usd || ticker.oi_value || ticker.oi || 0);
+        const oiPrev = oiSnapshotCache.get(symbol);
+        oiSnapshotCache.set(symbol, oiNow);
+        if (oiPrev === undefined) return null;
         if (!oiPrev) return null;
         const deltaPercent = (oiNow - oiPrev) / oiPrev * 100;
         return { oiNow, oiPrev, deltaPercent };
@@ -776,31 +788,23 @@ function shouldAlert(symbol, currentState, tf = '') {
 // ---------------------------------------------------------------------------
 // Pooled WebSocket architecture — a small number of connections (typically
 // 1-3) each subscribe to many symbols, instead of one connection per symbol.
-// This avoids the 80+ simultaneous TCP handshakes that trigger Bybit 403s.
+// This avoids too many simultaneous TCP handshakes on startup.
 // ---------------------------------------------------------------------------
 
 // Build the subscribe args array for a set of symbols
 function buildSubscribeArgs(symbols) {
-    const args = [];
-    for (const symbol of symbols) {
-        if (DUAL_EMA_MODE) {
-            args.push(`kline.5.${symbol}`, `kline.15.${symbol}`);
-        } else {
-            const bybitInterval = TIMEFRAME
-                .replace('4h', '240')
-                .replace('1h', '60')
-                .replace('m', '');
-            args.push(`kline.${bybitInterval}.${symbol}`);
-        }
-    }
-    return args;
+    const timeframes = DUAL_EMA_MODE ? getDualEmaTimeframes() : [TIMEFRAME];
+    return timeframes.map(tf => ({
+        name: `candlestick_${tf}`,
+        symbols
+    }));
 }
 
 // Create a single pool connection that subscribes to a chunk of symbols.
 // Returns a poolEntry { ws, symbols, index } stored in wsPool[index].
 function setupPoolConnection(index, symbols) {
     const poolKey = `pool_${index}`;
-    const wsUrl = 'wss://stream.bybit.com/v5/public/linear';
+    const wsUrl = DELTA_PUBLIC_WS_URL;
     let reconnectScheduled = false;
 
     try {
@@ -811,35 +815,36 @@ function setupPoolConnection(index, symbols) {
             reconnectionAttempts.set(poolKey, 0);
             reconnectScheduled = false;
             log(`Pool WS #${index} connected — subscribing ${symbols.length} symbols`, 'success');
-            ws.send(JSON.stringify({ op: 'subscribe', args: buildSubscribeArgs(symbols) }));
+            ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: buildSubscribeArgs(symbols) } }));
         });
 
         ws.on('message', (data) => {
             try {
                 const message = JSON.parse(data);
-                if (!message.topic || !message.topic.startsWith('kline')) return;
+                if (!message.type || !message.type.startsWith('candlestick_')) return;
 
-                const klineRaw   = message.data[0];
-                const topicParts = message.topic.split('.'); // ['kline','5','BTCUSDT']
-                const intervalStr = topicParts[1];
-                const symbol     = topicParts[2];
+                const symbol = message.sy;
+                if (!symbol) return;
+                const tf = message.res || message.type.replace('candlestick_', '');
+                const wsKey = `${symbol}_${tf}`;
+                const eventTs = Math.floor((message.ts || Date.now() * 1000) / 1000);
+                const prevTs = lastWsCandleTs.get(wsKey) || 0;
+                if (eventTs <= prevTs) return;
+                lastWsCandleTs.set(wsKey, eventTs);
 
                 const kline = {
-                    t: klineRaw.start,
-                    o: klineRaw.open,
-                    h: klineRaw.high,
-                    l: klineRaw.low,
-                    c: klineRaw.close,
-                    v: klineRaw.volume,
-                    x: klineRaw.confirm
+                    t: eventTs,
+                    o: message.o,
+                    h: message.h,
+                    l: message.l,
+                    c: message.c,
+                    v: message.v || 0,
+                    // Delta candlestick channel sends last closed candle snapshot.
+                    x: true
                 };
 
-                const tf = DUAL_EMA_MODE
-                    ? (intervalStr === '5' ? '5m' : '15m')
-                    : null;
-
                 if (kline.x === true) {
-                    processClosedCandle(symbol, kline, tf);
+                    processClosedCandle(symbol, kline, DUAL_EMA_MODE ? tf : null);
                 }
             } catch (error) {
                 log(`Error processing pool WS #${index} message: ${error.message}`, 'error');
@@ -908,8 +913,9 @@ function setupPooledWebSockets(allSymbols) {
             fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
         }
         if (DUAL_EMA_MODE) {
-            getKlines(symbol, '5m').catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
-            getKlines(symbol, '15m').catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
+            for (const tf of getDualEmaTimeframes()) {
+                getKlines(symbol, tf).catch(e => log(`Error loading ${tf} history for ${symbol}: ${e.message}`, 'error'));
+            }
         } else {
             getKlines(symbol).catch(e => log(`Error loading history for ${symbol}: ${e.message}`, 'error'));
         }
@@ -941,8 +947,9 @@ function subscribeSymbolToPool(symbol) {
         fs.mkdirSync(path.join(ML_DATA_DIR, safeSymbol), { recursive: true });
     }
     if (DUAL_EMA_MODE) {
-        getKlines(symbol, '5m').catch(e => log(`Error loading 5m history for ${symbol}: ${e.message}`, 'error'));
-        getKlines(symbol, '15m').catch(e => log(`Error loading 15m history for ${symbol}: ${e.message}`, 'error'));
+        for (const tf of getDualEmaTimeframes()) {
+            getKlines(symbol, tf).catch(e => log(`Error loading ${tf} history for ${symbol}: ${e.message}`, 'error'));
+        }
     } else {
         getKlines(symbol).catch(e => log(`Error loading history for ${symbol}: ${e.message}`, 'error'));
     }
@@ -951,7 +958,7 @@ function subscribeSymbolToPool(symbol) {
     const target = wsPool.find(e => e && e.ws.readyState === WebSocket.OPEN && e.symbols.size < WS_TOPICS_PER_CONN);
     if (target) {
         target.symbols.add(symbol);
-        target.ws.send(JSON.stringify({ op: 'subscribe', args: buildSubscribeArgs([symbol]) }));
+        target.ws.send(JSON.stringify({ type: 'subscribe', payload: { channels: buildSubscribeArgs([symbol]) } }));
         log(`Subscribed ${symbol} to pool WS #${target.index}`, 'info');
     } else {
         // No room or no open connections — create a new pool entry
@@ -1352,11 +1359,10 @@ async function updateStoredDataPoint(symbol, timestamp, priceChange) {
 async function getCurrentPrice(symbol) {
     try {
         await enforceRateLimit();
-        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
-            params: { category: 'linear', symbol },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers/${symbol}`, {
             timeout: 10000
         });
-        return parseFloat(response.data.result.list[0].lastPrice);
+        return parseFloat(response?.data?.result?.close || 0);
     } catch (error) {
         log(`Error getting current price for ${symbol}: ${error.message}`, 'error');
         throw error;
@@ -1657,7 +1663,9 @@ async function setupAllWebSockets() {
                 const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
                 csvWriterCache.delete(csvPath);
 
-                for (const key of [symbol, `${symbol}_5m`, `${symbol}_15m`]) {
+                const tfKeysToClear = new Set(['5m', '15m', ...getDualEmaTimeframes()]);
+                const cacheKeysToClear = [symbol, ...Array.from(tfKeysToClear).map(tf => tfKey(symbol, tf))];
+                for (const key of cacheKeysToClear) {
                     klineCache.delete(key);
                     emaCache.delete(key);
                     ema9Cache.delete(key);
@@ -1690,7 +1698,7 @@ async function setupAllWebSockets() {
 // Fetch REST promises in small batches to avoid saturating enforceRateLimit.
 // Without chunking, a concurrent Promise.all on 80+ getKlines calls all read the
 // same lastApiCall timestamp in the same millisecond — effectively bypassing the
-// rate limiter and triggering Bybit 429s which cause a backoff stall.
+// limiter and increasing 429/backoff risk.
 async function fetchInChunks(promises, chunkSize = 8, delayMs = 1500) {
     const results = [];
     for (let i = 0; i < promises.length; i += chunkSize) {
@@ -1716,9 +1724,9 @@ async function checkEMACross() {
         let results;
 
         if (DUAL_EMA_MODE) {
-            // In dual-TF mode fetch both 5m and 15m for every pair
+            // In dual-TF mode fetch all active timeframes for every pair
             const dualPromises = [];
-            for (const tf of ['5m', '15m']) {
+            for (const tf of getDualEmaTimeframes()) {
                 for (const pair of pairs) {
                     dualPromises.push(
                         getKlines(pair, tf)
@@ -1731,7 +1739,7 @@ async function checkEMACross() {
         } else {
             // Single-mode: use the same chunked fetcher as dual-mode so all 80+
             // getKlines calls don't race to read the same lastApiCall timestamp,
-            // bypassing enforceRateLimit and triggering Bybit 429s.
+            // bypassing enforceRateLimit and triggering rate-limit stalls.
             const singlePromises = pairs.map(pair =>
                 getKlines(pair)
                     .then(klines => ({ pair, tf: null, klines, error: null }))
@@ -2143,13 +2151,15 @@ async function startManualDataCollection(chatId) {
         for (const symbol of pairs) {
             try {
                 // In dual mode, pre-seed the 5m EMA + kline cache via a REST call so
-                // 5m crossover detection is ready immediately. Without this the 5m
-                // bucket stays empty until the first 5m WebSocket candle closes
-                // (up to 5 minutes after manual collection finishes).
-                if (DUAL_EMA_MODE) await getKlines(symbol, '5m');
+                // selected dual-timeframe buckets are ready immediately.
+                if (DUAL_EMA_MODE) {
+                    for (const tf of getDualEmaTimeframes()) {
+                        await getKlines(symbol, tf);
+                    }
+                }
 
-                // Get historical klines (15m or flat depending on mode)
-                const klines = await getKlines(symbol);
+                // Use default klines in single mode; in dual mode replay 15m cache for training compatibility.
+                const klines = await getKlines(symbol, DUAL_EMA_MODE ? '15m' : null);
                 if (klines.length < 30) {
                     log(`Skipping ${symbol}: Not enough candles`, 'warning');
                     failedCount++;
@@ -2327,12 +2337,29 @@ async function handleCallbackQuery(callbackQuery) {
             await bot.sendMessage(
                 chatId,
                 DUAL_EMA_MODE
-                    ? '✅ *EMA 9/15 Crossover Mode Enabled [5m + 15m]*\nAlerts will fire when EMA(9) crosses EMA(15) on BOTH the 5-minute and 15-minute timeframes independently. Single EMA settings are ignored.'
+                    ? `✅ *EMA 9/15 Crossover Mode Enabled [${getDualEmaTimeframes().join(' + ')}]*\nAlerts will fire when EMA(9) crosses EMA(15) on all active dual-mode timeframes independently. Single EMA settings are ignored.`
                     : `✅ *EMA 9/15 Mode Disabled*\nReverted to Price vs EMA(${EMA_PERIOD}) crossover mode.`,
                 { parse_mode: 'Markdown' }
             );
             await sendSettingsMenu(chatId); // show updated menu immediately
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
+        } else if (action === 'toggle_fast_tfs') {
+            INCLUDE_FAST_TFS = !INCLUDE_FAST_TFS;
+            log(`Fast dual timeframes ${INCLUDE_FAST_TFS ? 'enabled' : 'disabled'}`, 'success');
+            saveSettings();
+            emaCache.clear();
+            ema9Cache.clear();
+            ema15Cache.clear();
+            coinStates.clear();
+            await bot.sendMessage(
+                chatId,
+                INCLUDE_FAST_TFS
+                    ? '⚡ *Fast TF Add-on Enabled*\nDual EMA mode will monitor 1m + 3m + 5m + 15m together.'
+                    : '⚡ *Fast TF Add-on Disabled*\nDual EMA mode will monitor 5m + 15m only.',
+                { parse_mode: 'Markdown' }
+            );
+            await sendSettingsMenu(chatId);
+            refreshWebSockets(chatId);
         } else if (action.startsWith('volume_')) {
             const newVolume = parseInt(action.replace('volume_', ''), 10);
             if (!VALID_VOLUMES.includes(newVolume)) {
@@ -2385,7 +2412,8 @@ function saveSettings() {
             CHECK_INTERVAL,
             ALERT_COOLDOWN,
             ML_ENABLED,
-            DUAL_EMA_MODE
+            DUAL_EMA_MODE,
+            INCLUDE_FAST_TFS
         };
 
         fs.writeFile(
@@ -2416,7 +2444,8 @@ function loadSettings() {
                 'CHECK_INTERVAL',
                 'ALERT_COOLDOWN',
                 'ML_ENABLED',
-                'DUAL_EMA_MODE'
+                'DUAL_EMA_MODE',
+                'INCLUDE_FAST_TFS'
             ]);
 
             for (const key of Object.keys(parsed)) {
@@ -2434,6 +2463,7 @@ function loadSettings() {
             if (VALID_VOLUMES.includes(settings.VOLUME_THRESHOLD)) VOLUME_THRESHOLD = settings.VOLUME_THRESHOLD;
             ML_ENABLED = settings.ML_ENABLED !== undefined ? settings.ML_ENABLED : ML_ENABLED;
             DUAL_EMA_MODE = settings.DUAL_EMA_MODE !== undefined ? settings.DUAL_EMA_MODE : DUAL_EMA_MODE;
+            if (typeof settings.INCLUDE_FAST_TFS === 'boolean') INCLUDE_FAST_TFS = settings.INCLUDE_FAST_TFS;
 
             log('Settings loaded from file', 'success');
         }
@@ -2479,14 +2509,14 @@ async function sendStatusUpdate(chatId) {
 
         const message = `*EMA Tracker Status*\n\n` +
             `*Active Configuration:*\n` +
-            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover [5m + 15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
-            `- Timeframe: ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME}\n` +
+            `- EMA Mode: ${DUAL_EMA_MODE ? `EMA 9/15 Crossover [${getDualEmaTimeframes().join(' + ')}]` : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
+            `- Timeframe: ${DUAL_EMA_MODE ? getDualEmaTimeframes().join(' + ') : TIMEFRAME}\n` +
             `- Volume Threshold: ${VOLUME_THRESHOLD.toLocaleString()}\n` +
             `- Monitoring: ${pairs.length} pairs\n` +
             `- Active WebSockets: ${activeWsCount}/${pairs.length}\n` +
             `- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n` +
             `- Last Check: ${new Date().toLocaleString()}\n\n` +
-            `Bot is actively monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15 [5m + 15m]' : 'EMA'} crossovers in real-time.`;
+            `Bot is actively monitoring for ${DUAL_EMA_MODE ? `EMA 9/15 [${getDualEmaTimeframes().join(' + ')}]` : 'EMA'} crossovers in real-time.`;
 
         await bot.sendMessage(chatId, message, {
             parse_mode: 'Markdown',
@@ -2526,6 +2556,13 @@ async function sendSettingsMenu(chatId) {
                 { text: `EMA 9/15 Cross: ${DUAL_EMA_MODE ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_dual_ema' }
             ],
             [
+                { text: `Fast TF (1m/3m): ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_fast_tfs' }
+            ],
+            [
+                { text: 'Vol 5M', callback_data: 'volume_5000000' },
+                { text: 'Vol 10M', callback_data: 'volume_10000000' }
+            ],
+            [
                 { text: 'Vol 20M', callback_data: 'volume_20000000' },
                 { text: 'Vol 50M', callback_data: 'volume_50000000' }
             ],
@@ -2541,7 +2578,7 @@ async function sendSettingsMenu(chatId) {
     };
 
     const configText = DUAL_EMA_MODE
-        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: 5m + 15m (both monitored)\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors both 5m and 15m timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
+        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: ${getDualEmaTimeframes().join(' + ')} (all monitored)\n- Fast TF Add-on: ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors all active dual timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
         : `*Settings*\n\nCurrent Configuration:\n- EMA: ${EMA_PERIOD}\n- Timeframe: ${TIMEFRAME}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\nSelect a new setting:`;
 
     await bot.sendMessage(chatId, configText, {
@@ -2553,7 +2590,7 @@ async function sendSettingsMenu(chatId) {
 // Send help message
 async function sendHelpMessage(chatId) {
     const helpText = `*EMA Tracker Bot Help*\n\n` +
-        `This bot monitors Bybit Futures markets for EMA crossovers and sends alerts when they occur.\n\n` +
+        `This bot monitors Delta Exchange Futures markets for EMA crossovers and sends alerts when they occur.\n\n` +
         `*Available Commands:*\n` +
         `/menu - Show the main menu\n` +
         `/status - Check bot status\n` +
@@ -2586,22 +2623,32 @@ async function sendTopPerformers(chatId, type = 'gainers') {
         await bot.sendMessage(chatId, '⏳ Fetching data...');
 
         await enforceRateLimit();
-        const response = await axios.get('https://api.bybit.com/v5/market/tickers', {
-            params: { category: 'linear' },
+        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers`, {
+            params: { contract_types: 'perpetual_futures' },
             timeout: 10000
         });
-        let coins = response.data.result.list.filter(coin => coin.symbol.endsWith('USDT'));
+        const apiCoins = response?.data?.result;
+        if (!Array.isArray(apiCoins)) {
+            throw new Error('Unexpected Delta tickers response shape');
+        }
+
+        let coins = apiCoins.filter(coin => coin.symbol && coin.contract_type === 'perpetual_futures');
 
         // Sort based on type
         if (type === 'gainers') {
-            coins.sort((a, b) => parseFloat(b.price24hPcnt) - parseFloat(a.price24hPcnt));
+            coins.sort((a, b) => parseFloat(b.ltp_change_24h || 0) - parseFloat(a.ltp_change_24h || 0));
             coins = coins.slice(0, 10); // Top 10 gainers
         } else if (type === 'losers') {
-            coins.sort((a, b) => parseFloat(a.price24hPcnt) - parseFloat(b.price24hPcnt));
+            coins.sort((a, b) => parseFloat(a.ltp_change_24h || 0) - parseFloat(b.ltp_change_24h || 0));
             coins = coins.slice(0, 10); // Top 10 losers
         } else if (type === 'volume') {
-            coins.sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h));
+            coins.sort((a, b) => parseFloat(b.turnover_usd || b.turnover || 0) - parseFloat(a.turnover_usd || a.turnover || 0));
             coins = coins.slice(0, 10); // Top 10 by volume
+        }
+
+        if (coins.length === 0) {
+            await bot.sendMessage(chatId, '⚠️ No ticker data available for top performers right now.');
+            return;
         }
 
         let title;
@@ -2613,9 +2660,9 @@ async function sendTopPerformers(chatId, type = 'gainers') {
 
         coins.forEach((coin, index) => {
             const symbol = coin.symbol;
-            const price = formatPrice(parseFloat(coin.lastPrice));
-            const change = (parseFloat(coin.price24hPcnt) * 100).toFixed(2);
-            const volume = formatVolume(parseFloat(coin.turnover24h));
+            const price = formatPrice(parseFloat(coin.close || 0));
+            const change = parseFloat(coin.ltp_change_24h || 0).toFixed(2);
+            const volume = formatVolume(parseFloat(coin.turnover_usd || coin.turnover || 0));
 
             const changeEmoji = parseFloat(change) >= 0 ? '🟢' : '🔴';
             message += `${index + 1}. ${symbol}: ${price} (${changeEmoji} ${change}%) - Vol: ${volume}\n`;
@@ -2711,14 +2758,14 @@ async function sendStartupMessage() {
     try {
         const message = `🤖 *EMA Tracker Bot Started* 🤖\n\n` +
             `*Configuration:*\n` +
-            `- EMA Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 Crossover [5m + 15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
-            `- Timeframe: ${DUAL_EMA_MODE ? '5m + 15m (both monitored)' : TIMEFRAME}\n` +
+            `- EMA Mode: ${DUAL_EMA_MODE ? `EMA 9/15 Crossover [${getDualEmaTimeframes().join(' + ')}]` : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
+            `- Timeframe: ${DUAL_EMA_MODE ? `${getDualEmaTimeframes().join(' + ')} (all monitored)` : TIMEFRAME}\n` +
             `- Volume Threshold: ${VOLUME_THRESHOLD.toLocaleString()}\n` +
             `- Check Interval: ${(CHECK_INTERVAL / 60000).toFixed(1)} minutes\n` +
             `- Alert Cooldown: ${(ALERT_COOLDOWN / 60000).toFixed(1)} minutes\n` +
             `- WebSocket Monitoring: Enabled\n` +
             `- ML Enhancement: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\n` +
-            `Bot is now monitoring for ${DUAL_EMA_MODE ? 'EMA 9/15 crossovers on both 5m and 15m' : 'EMA crossovers'} in real-time${ML_ENABLED ? ' with ML predictions' : ''}...`;
+            `Bot is now monitoring for ${DUAL_EMA_MODE ? `EMA 9/15 crossovers on ${getDualEmaTimeframes().join(', ')}` : 'EMA crossovers'} in real-time${ML_ENABLED ? ' with ML predictions' : ''}...`;
 
         await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
         log('Startup message sent to Telegram', 'success');
@@ -2726,7 +2773,7 @@ async function sendStartupMessage() {
         // Show desktop notification — mirrors startup message content
         showDesktopNotification(
             '🤖 EMA Tracker Started',
-            `Mode: ${DUAL_EMA_MODE ? 'EMA 9/15 [5m+15m]' : 'Price vs EMA(' + EMA_PERIOD + ')'}\nTimeframe: ${DUAL_EMA_MODE ? '5m + 15m' : TIMEFRAME}  Vol: ${formatVolume(VOLUME_THRESHOLD)}\nML: ${ML_ENABLED ? 'Enabled' : 'Disabled'}`,
+            `Mode: ${DUAL_EMA_MODE ? `EMA 9/15 [${getDualEmaTimeframes().join('+')}]` : 'Price vs EMA(' + EMA_PERIOD + ')'}\nTimeframe: ${DUAL_EMA_MODE ? getDualEmaTimeframes().join(' + ') : TIMEFRAME}  Vol: ${formatVolume(VOLUME_THRESHOLD)}\nML: ${ML_ENABLED ? 'Enabled' : 'Disabled'}`,
             'info'
         );
 
@@ -2783,11 +2830,11 @@ function startWebSocketHeartbeat() {
         }
     }, 3 * 60 * 1000);
 
-    // Bybit requires an application-level JSON ping every 20 seconds
+    // Public WS heartbeat ping
     setInterval(() => {
         for (const entry of wsPool) {
             if (entry && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
-                entry.ws.send(JSON.stringify({ op: 'ping' }));
+                entry.ws.send(JSON.stringify({ type: 'ping' }));
             }
         }
     }, 20 * 1000);
