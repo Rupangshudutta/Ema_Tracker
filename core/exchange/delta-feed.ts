@@ -8,6 +8,7 @@ export type FeedEvent =
   | { type: 'subscribed'; symbols: string[] }
   | { type: 'unsubscribed'; symbols: string[] }
   | { type: 'error'; message: string }
+  | { type: 'heartbeat' }
   | { type: 'ignored'; reason: string };
 
 const CHANNEL = SYSTEM.realtime.channel;
@@ -53,6 +54,8 @@ export function parseFeedMessage(raw: string): FeedEvent {
       return { type: 'subscribed', symbols: channelSymbols(msg) };
     case 'unsubscribed':
       return { type: 'unsubscribed', symbols: channelSymbols(msg) };
+    case 'heartbeat':
+      return { type: 'heartbeat' };
     case 'error':
       return { type: 'error', message: typeof msg.message === 'string' ? msg.message : JSON.stringify(msg).slice(0, 300) };
     default:
@@ -65,6 +68,9 @@ const frame = (type: 'subscribe' | 'unsubscribe', symbols: readonly string[]): s
 
 export const subscribeMessage = (symbols: readonly string[]): string => frame('subscribe', symbols);
 export const unsubscribeMessage = (symbols: readonly string[]): string => frame('unsubscribe', symbols);
+
+/** Asks Delta to send {"type":"heartbeat"} every 30 s, so a silent dead connection is noticed (Delta docs, Detecting Connection Drops). */
+export const enableHeartbeatMessage = JSON.stringify({ type: 'enable_heartbeat' });
 
 /** What to send so the live subscriptions match the watchlist (removed coins are unsubscribed, closing their feed). */
 export function diffSubscriptions(current: ReadonlySet<string>, wanted: ReadonlySet<string>): { subscribe: string[]; unsubscribe: string[] } {

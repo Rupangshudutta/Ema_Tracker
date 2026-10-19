@@ -1,10 +1,8 @@
-// Cloudflare entry point (the "receptionist").
-// Stage S0: serves the probe report and wakes the Tracker every minute. Replaced by the full bot in S4.
+// Cloudflare entry point (the "receptionist"): passes every web request to the Tracker Durable Object and pokes it
+// every minute so its alarm can never be lost. All logic lives in the Tracker's engine.
 import { Tracker } from './tracker.ts';
 
 export { Tracker };
-
-const VERSION = '2.0.1-probe';
 
 // `wrangler types` only types this binding when its own pre-build check passes, so declare it here explicitly.
 type WorkerEnv = Omit<Env, 'TRACKER'> & { TRACKER: DurableObjectNamespace<Tracker> };
@@ -15,16 +13,10 @@ function tracker(env: WorkerEnv): DurableObjectStub<Tracker> {
 
 export default {
   async fetch(request, env): Promise<Response> {
-    const url = new URL(request.url);
-    if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
-    if (url.pathname === '/health') return Response.json({ ok: true, stage: 'probe', version: VERSION });
-    if (url.pathname === '/probe') {
-      return Response.json(await tracker(env).report(), { headers: { 'cache-control': 'no-store' } });
-    }
-    return new Response('Not found', { status: 404 });
+    return tracker(env).fetch(request);
   },
 
-  async scheduled(controller, env, ctx): Promise<void> {
-    ctx.waitUntil(tracker(env).tick(controller.scheduledTime));
+  async scheduled(_controller, env, ctx): Promise<void> {
+    ctx.waitUntil(tracker(env).tick());
   }
 } satisfies ExportedHandler<WorkerEnv>;

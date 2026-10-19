@@ -3,6 +3,7 @@
 import { SYSTEM, TIMEFRAME_MS, type Timeframe, type UserSettings } from '../config/settings.ts';
 import type { Direction } from '../domain/signal.ts';
 import { escapeHtml } from '../notify/telegram.ts';
+import type { EngineStatus } from './engine.ts';
 
 /** Ticker numbers shown with an alert; taken from the cached ticker so they never delay or block the alert (I5, I9). */
 export interface TickerContext {
@@ -180,6 +181,60 @@ export function renderMissed(items: readonly { payload: AlertPayload; eventAt: n
     ...items.map(i => `${fmtTime(i.eventAt, timeZone)} ${alertLine(i.payload)}`)
   ];
   if (droppedOld) lines.push(`${droppedOld} more ${droppedOld === 1 ? 'was' : 'were'} older than ${SYSTEM.delivery.maxAlertAgeHours} h and dropped.`);
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------- status and daily report
+
+const n = (v: number | undefined): string => (v ?? 0).toLocaleString('en-US');
+
+function settingsLine(s: UserSettings): string {
+  return `Margin ${s.signal.marginPct.toFixed(2)}% · volume filter ${fmtUsd(s.coins.volumeThresholdUsd)} · new coins on ${s.coins.defaultTimeframes.join(', ')} · cancel notes ${s.realtime.cancelNotes ? 'on' : 'off'} · daily report ${s.monitoring.dailyReportTime} ${tzLabel(s.monitoring.timeZone)}`;
+}
+
+function feedLine(st: EngineStatus, now: number): string {
+  const f = st.feed;
+  if (!f.wanted) return 'Live feed: idle (no coins on the watchlist)';
+  if (f.connected) return `Live feed: connected · ${f.wanted} coin${f.wanted === 1 ? '' : 's'}`;
+  const down = f.downSince === null ? '' : ` for ${fmtDuration(now - f.downSince)}`;
+  const next = f.nextConnectAt === null ? '' : `, reconnecting in ${fmtDuration(Math.max(0, f.nextConnectAt - now))}`;
+  return `Live feed: <b>down</b>${down}${next}${f.quickDrops ? ` (${f.quickDrops} quick drops in a row)` : ''}`;
+}
+
+export function renderStatus(st: EngineStatus, now: number): string {
+  const tz = st.settings.monitoring.timeZone;
+  const paused = st.settings.delivery.pausedUntil;
+  return [
+    `📊 <b>Status</b> · ${fmtTime(now, tz)} ${tzLabel(tz)}`,
+    `Engine: ${st.runtime} · <b>${st.role}</b> (${escapeHtml(st.roleReason)}) · v${escapeHtml(st.version)}`,
+    st.problems.length ? `Health: ⚠️ ${escapeHtml(st.problems.join('; '))}` : 'Health: ✅ all good',
+    feedLine(st, now),
+    `Coins: ${st.coins.active} watched · ${st.coins.paused} paused · ${st.coins.removed} removed · ${st.coins.series} coin-timeframes`,
+    `Last candle check: ${st.lastMinuteAt === null ? 'not yet' : `${fmtDuration(now - st.lastMinuteAt)} ago`}`,
+    st.delta.failingSince === null ? 'Delta API: ok' : `Delta API: <b>failing</b> for ${fmtDuration(now - st.delta.failingSince)} (${escapeHtml(st.delta.lastError ?? '')})`,
+    `Messages waiting: ${st.outbox.pending}`,
+    paused !== null && paused > now ? `Alerts: ⏸ paused until ${fmtDateTime(paused, tz)} ${tzLabel(tz)}` : 'Alerts: on',
+    settingsLine(st.settings)
+  ].join('\n');
+}
+
+export function renderDailyReport(st: EngineStatus, stats: Readonly<Record<string, number>>, windowMs: number, now: number): string {
+  const tz = st.settings.monitoring.timeZone;
+  const hours = Math.max(1, Math.round(windowMs / 3_600_000));
+  const sent = (stats.sent_confirmed ?? 0) + (stats.sent_realtime ?? 0) + (stats.sent_cancel ?? 0) + (stats.sent_not_confirmed ?? 0) + (stats.sent_notes ?? 0);
+  const upPct = st.feed.wanted ? Math.max(0, 100 * (1 - (stats.feed_down_ms ?? 0) / windowMs)) : null;
+  const restCalls = (stats.rest_ok ?? 0) + (stats.rest_fail ?? 0) + (stats.rest_429 ?? 0);
+  const lines = [
+    `☀️ <b>Daily report</b> · ${fmtDateTime(now, tz)} ${tzLabel(tz)}`,
+    `I'm alive: ${st.runtime} is sending alerts · v${escapeHtml(st.version)}`,
+    `Coins: ${st.coins.active} watched · ${st.coins.paused} paused · ${st.coins.removed} removed`,
+    `Last ${hours} h: ✅ ${n(stats.alerts_confirmed)} confirmed · ⚡ ${n(stats.alerts_realtime)} realtime · ↩️ ${n(stats.alerts_realtime_cancel)} cancelled · ❌ ${n(stats.alerts_not_confirmed)} not confirmed${stats.alerts_suppressed ? ` · ${n(stats.alerts_suppressed)} held back while paused` : ''}`,
+    `Delivery: ${n(sent)} messages · ${n(stats.late)} late · ${n(stats.missed)} in a missed-summary · ${n(stats.expired)} dropped (too old) · ${n(stats.failed)} failed`,
+    upPct === null ? 'Live feed: idle' : `Live feed: up ${upPct.toFixed(1)}% · ${n(stats.feed_drops)} drops · price fallback ${n(stats.fallback_minutes)} min`,
+    `Delta API: ${n(restCalls)} calls · ${n(stats.rest_fail)} failed · ${n(stats.rest_429)} rate-limited${stats.series_problems ? ` · ${n(stats.series_problems)} late or missing candles` : ''}`,
+    settingsLine(st.settings)
+  ];
+  if (st.problems.length) lines.push(`⚠️ Right now: ${escapeHtml(st.problems.join('; '))}`);
   return lines.join('\n');
 }
 

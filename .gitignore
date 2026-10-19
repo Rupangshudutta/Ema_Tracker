@@ -12,6 +12,11 @@ variants/
 
 # Secrets & runtime config (use environment variables instead)
 .env
+.env.docker
+.env.*.local
+
+# Docker spare data (SQLite notebook when run outside a volume)
+data/
 
 # OS files
 .DS_Store
@@ -30,3 +35,5 @@ alert_state
 
 # Template listing the secret names (no values); must stay tracked
 !.dev.vars.example
+
+.sf/

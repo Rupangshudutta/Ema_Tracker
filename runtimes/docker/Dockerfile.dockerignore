@@ -1,0 +1,9 @@
+# Build context for runtimes/docker/Dockerfile (BuildKit reads <Dockerfile>.dockerignore next to the Dockerfile).
+# Allow-list: only the v2 sources go into the image; secrets, git history and the old bot never do.
+*
+!core/
+!runtimes/package.json
+!runtimes/docker/
+runtimes/docker/*.md
+runtimes/docker/Dockerfile*
+runtimes/docker/compose.yaml

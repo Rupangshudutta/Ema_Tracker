@@ -337,6 +337,11 @@ export class Store {
     });
   }
 
+  /** Marks every pending message suppressed (this runtime went to standby; the other one sends from now on). */
+  suppressPending(): void {
+    this.db.run("UPDATE outbox SET status = 'suppressed' WHERE status = 'pending'");
+  }
+
   /** Pushes every pending message to `nextAt` or later (after a Telegram 429 or while Telegram refuses the bot). */
   delayPending(nextAt: number): void {
     this.db.run("UPDATE outbox SET next_at = MAX(next_at, ?) WHERE status = 'pending'", nextAt);
@@ -353,6 +358,11 @@ export class Store {
   }
 
   // ---------------------------------------------------------------- log and counters
+
+  /** Records who changed what (settings, watchlist, engine switches). */
+  audit(at: number, actor: string, change: string): void {
+    this.db.run('INSERT INTO settings_audit (at, actor, change) VALUES (?, ?, ?)', at, actor, change.slice(0, 500));
+  }
 
   log(at: number, level: LogRow['level'], kind: string, detail: string): void {
     this.db.run('INSERT INTO log (at, level, kind, detail) VALUES (?, ?, ?, ?)', at, level, kind, detail.slice(0, 500));

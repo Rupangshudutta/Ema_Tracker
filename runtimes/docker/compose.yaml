@@ -1,0 +1,36 @@
+# EMA Tracker v2 Docker spare. See docs/RUNBOOK.md.
+#   start (standby):        docker compose -f runtimes/docker/compose.yaml up -d --build
+#   emergency takeover:     $env:RUNTIME_ROLE='active'; docker compose -f runtimes/docker/compose.yaml up -d
+name: ema-tracker
+
+services:
+  ema-tracker:
+    build:
+      context: ../..
+      dockerfile: runtimes/docker/Dockerfile
+    image: ema-tracker:2
+    restart: unless-stopped
+    env_file:
+      - path: ../../.env.docker
+        required: true
+    environment:
+      RUNTIME_ROLE: ${RUNTIME_ROLE:-standby}
+    volumes:
+      - ema-data:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ema-data:

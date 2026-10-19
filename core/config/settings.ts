@@ -42,7 +42,12 @@ export const SYSTEM = {
   },
   realtime: {
     channel: 'v2/ticker',
-    feedStaleSeconds: 30
+    /** Delta sends a heartbeat every 30 s once enabled, so 35 s of silence means the connection is dead (Delta docs). */
+    feedStaleSeconds: 35,
+    /** Waits before reconnecting after 0, 1, 2... quick drops in a row. Delta allows 150 connections per IP per 5 min and asks for 5 to 10 min after a refusal. */
+    reconnectDelaysSeconds: [2, 5, 15, 60, 300, 600],
+    /** A connection that dies sooner than this counts as a quick drop. */
+    healthyAfterSeconds: 60
   },
   timing: {
     settleSeconds: 3

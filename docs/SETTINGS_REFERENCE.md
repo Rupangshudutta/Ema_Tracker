@@ -21,10 +21,10 @@ Which engine is running and whether it is allowed to send.
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
 | `RUNTIME` | Which shell is running the core | cloudflare | cloudflare, docker | Set by the build | Nobody |
-| `RUNTIME_ROLE` | Only the active engine sends alerts and owns Telegram; standby only watches | active on Cloudflare, standby in Docker | active, standby | Cloudflare vars / Docker .env | You, when switching |
-| `PUBLIC_BASE_URL` | Web address of the mini app and health page | your workers.dev address | https URL | Cloudflare vars | Set up once |
+| `RUNTIME_ROLE` | Who may send is decided by who holds the Telegram connection (webhook on Cloudflare, polling in Docker). On Cloudflare, active = may claim the webhook, standby = never sends. In Docker, standby = follow the connection, active = take it at start (emergency) | active on Cloudflare, standby in Docker | active, standby | Cloudflare vars / Docker compose (`$env:RUNTIME_ROLE`) | You, in an emergency |
+| `PUBLIC_BASE_URL` | Cloudflare's web address: the webhook, mini app and health page live there, and the Docker spare uses it to copy settings and check in | your workers.dev address | https URL | Cloudflare vars / Docker .env.docker | Set up once |
 | `DATA_DIR` | Where Docker keeps its SQLite file | /data | A mounted volume path | Docker compose file | Set up once |
-| `LOG_LEVEL` | How much detail goes into logs | info | debug, info, warn, error | Cloudflare vars / Docker .env | Rarely |
+| `LOG_LEVEL` | Reserved; not read yet (the engine logs state changes and problems only) | info | debug, info, warn, error | Cloudflare vars | Nobody yet |
 
 ## Exchange (Delta India)
 
@@ -70,7 +70,9 @@ Live alerts while a candle is still open. They run on every watchlist coin and t
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
 | `realtimeCancelNotes` | Send a short note when a realtime cross undoes itself before the close | on | on, off | Telegram menu | You |
-| `feedStaleSeconds` | Silence on the live feed before the bot reconnects | 30 | Fixed | Config file in git | Nobody |
+| `feedStaleSeconds` | Silence on the live feed before the bot reconnects (Delta heartbeat is every 30 s) | 35 | Fixed | Config file in git | Nobody |
+| `reconnectDelaysSeconds` | Wait before reconnecting after 0, 1, 2... quick drops in a row (Delta allows 150 connections per IP per 5 min) | 2, 5, 15, 60, 300, 600 | Fixed | Config file in git | Nobody |
+| `healthyAfterSeconds` | A connection that dies sooner than this counts as a quick drop | 60 | Fixed | Config file in git | Nobody |
 
 ## Timing
 
