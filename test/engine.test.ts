@@ -2,7 +2,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { SYSTEM, TIMEFRAME_MS } from '../core/config/settings.ts';
-import { closedSeries } from '../core/domain/candles.ts';
+import { closedSeries, lastClosedStart } from '../core/domain/candles.ts';
 import { evaluateConfirmed } from '../core/domain/signal.ts';
 import { BASE, FakeWorld, MIN, envFor, makeEngine, runUntil, settle } from './fake-world.ts';
 
@@ -162,6 +162,20 @@ describe('engine on Cloudflare: watchlist, standby and reports', () => {
     assert.equal(engine.status().coins.active, 1);
     assert.deepEqual(engine.setCoinTimeframes('ETHUSD', ['5m', '1h'], 'user:777'), { ok: true, message: 'ETHUSD added: 5m, 1h' });
     assert.equal(engine.setCoinTimeframes('LOWUSD', ['5m'], 'user:777').ok, false, 'coins below the filter cannot be added');
+  });
+
+  it('runs coins on 1m and 3m: a fresh confirmed state after every 1-minute and 3-minute close', async () => {
+    const w = world(PIVOT - 60 * MIN + 3500);
+    const engine = makeEngine(w);
+    await runUntil(w, engine, PIVOT - 58 * MIN);
+    assert.deepEqual(engine.setCoinTimeframes('BTCUSD', ['3m', '1m', '15m'], 'user:777'), { ok: true, message: 'BTCUSD: 1m, 3m, 15m' });
+    for (const at of [PIVOT - 50 * MIN + 20_000, PIVOT - 46 * MIN + 20_000]) {
+      await runUntil(w, engine, at);
+      const rec = (tf: '1m' | '3m'): number | undefined => engine.store.seriesAll().find(r => r.symbol === 'BTCUSD' && r.timeframe === tf)?.state.lastCloseStart;
+      assert.equal(rec('1m'), lastClosedStart(w.now, TIMEFRAME_MS['1m']));
+      assert.equal(rec('3m'), lastClosedStart(w.now, TIMEFRAME_MS['3m']));
+    }
+    assert.ok(w.feedSent.some(m => m.includes('BTCUSD')), 'live prices drive realtime alerts on 1m and 3m too');
   });
 
   it('goes to standby when the webhook points elsewhere and then sends nothing', async () => {

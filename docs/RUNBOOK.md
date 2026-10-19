@@ -34,7 +34,7 @@ Address: https://ema-tracker.rupangshudutta.workers.dev (health page: `/health`)
 | --- | --- |
 | See if everything is fine | `/status`, or wait for the daily report (09:00 IST by default) |
 | Change margin, volume filter, report time | `/start` → Settings |
-| Pick coins and timeframes | `/start` → Coins, search, tick 5m / 15m / 1h / 4h. Untick everything to remove a coin |
+| Pick coins and timeframes | `/start` → Coins, search, tick 1m / 3m / 5m / 15m / 1h / 4h. Untick everything to remove a coin. 1m and 3m are fast and noisy: expect many more alerts |
 | Do it by typing | `/watch BTCUSD 5m 15m`, `/unwatch BTCUSD`, `/coins` |
 | Mute alerts for a while | `/pause 2h` or `/start` → Pause; `/resume` to undo |
 | See the market | `/start` → 📈 Top gainers, 📉 Top losers, 💰 Highest volume (24 h, top 10), or `/top`. Gainers and losers skip coins under $1M volume; 👁 marks coins on your watchlist |
@@ -124,7 +124,7 @@ docker compose -f runtimes/docker/compose.yaml down
 | --- | --- |
 | 50 outbound calls per run | Each run uses at most 45; bigger candle closes continue in a follow-up run a second later |
 | 100,000 Durable Object requests a day | About 3,000 to 4,000 (one alarm and one timer call a minute, plus Telegram) |
-| 100,000 SQLite rows written a day | About 1,500 with 12 coins on 15m; under 10,000 with 16 coins on all four timeframes |
+| 100,000 SQLite rows written a day | About 3,000 with 12 coins on 15m. Each coin on 1m adds about 1,450 a day and on 3m about 500; 16 coins on all six timeframes is about 40,000 |
 | 13,000 GB-seconds of Durable Object time a day | The always-open live feed keeps the desk worker awake: about 10,800 |
 
 Not verified: whether Cloudflare counts incoming live-feed messages against the free plan. Check **Workers & Pages → ema-tracker → Metrics** after the first full day.

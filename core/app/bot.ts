@@ -179,7 +179,7 @@ function helpScreen(engine: Engine): Screen {
   return {
     html: [
       '❓ <b>How the alerts work</b>',
-      `Every coin on the watchlist is checked on each ticked timeframe (5m, 15m, 1h, 4h) for EMA 9 crossing EMA 15 by more than the margin (${s.signal.marginPct.toFixed(2)}%).`,
+      `Every coin on the watchlist is checked on each ticked timeframe (${TIMEFRAMES.join(', ')}) for EMA 9 crossing EMA 15 by more than the margin (${s.signal.marginPct.toFixed(2)}%).`,
       '⚡ <b>REALTIME</b>: the live price crossed while the candle is still open. At most one per candle.',
       '↩️ <b>REALTIME CANCELLED</b>: that cross reversed before the close.',
       '✅ <b>CONFIRMED</b>: the closed candle confirms the cross. This is the one to trust.',
@@ -324,7 +324,7 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
       const symbol = (args[0] ?? '').toUpperCase();
       if (!/^[A-Z0-9_.-]{2,40}$/.test(symbol)) return send(`Which coin? For example <code>${command} BTCUSD${command === '/watch' ? ' 5m 15m' : ''}</code>`);
       const tfs = command === '/unwatch' ? [] : args.slice(1).map(a => a.toLowerCase());
-      if (command === '/watch' && !tfs.length) return send('Which timeframes? For example <code>/watch BTCUSD 5m 15m</code> (5m, 15m, 1h, 4h).');
+      if (command === '/watch' && !tfs.length) return send(`Which timeframes? For example <code>/watch BTCUSD 5m 15m</code> (${TIMEFRAMES.join(', ')}).`);
       const r = engine.setCoinTimeframes(symbol, tfs, actor);
       return send(r.ok ? `✅ ${escapeHtml(r.message)}` : `❌ ${escapeHtml(r.reason)}`);
     }

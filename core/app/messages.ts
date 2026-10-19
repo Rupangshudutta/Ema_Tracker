@@ -1,6 +1,6 @@
 // What the bot says. Every Telegram text is built here, so wording and layout live in one place.
 // Alerts are stored as structured payloads and rendered at send time, which is how a delayed alert gets its LATE line.
-import { SYSTEM, TIMEFRAME_MS, type Timeframe, type UserSettings } from '../config/settings.ts';
+import { SYSTEM, TIMEFRAMES, TIMEFRAME_MS, type Timeframe, type UserSettings } from '../config/settings.ts';
 import type { Direction } from '../domain/signal.ts';
 import { escapeHtml } from '../notify/telegram.ts';
 import type { EngineStatus } from './engine.ts';
@@ -286,7 +286,7 @@ export type StartKind = 'first' | 'deploy' | 'outage' | 'restart';
 function watchSummary(watch: readonly { symbol: string; timeframes: readonly Timeframe[]; status: string }[]): string {
   const active = watch.filter(w => w.status === 'active');
   if (!active.length) return 'No coins on the watchlist yet: coins above your volume filter join within a minute.';
-  const groups = (['5m', '15m', '1h', '4h'] as const)
+  const groups = TIMEFRAMES
     .map(tf => ({ tf, coins: active.filter(w => w.timeframes.includes(tf)).map(w => escapeHtml(w.symbol)) }))
     .filter(g => g.coins.length)
     .map(g => `${g.tf}: ${g.coins.join(', ')}`);

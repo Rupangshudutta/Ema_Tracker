@@ -8,7 +8,7 @@
 //   3. confirmed alerts for every coin-timeframe whose candle just closed (fresh closed candles, hysteresis rule)
 //   4. daily report, degraded warnings, Healthchecks ping, then the outbox
 // Between minutes, live prices drive the realtime alerts.
-import { SYSTEM, TIMEFRAME_MS, isTimeframe, type Timeframe, type UserSettings } from '../config/settings.ts';
+import { SYSTEM, TIMEFRAMES, TIMEFRAME_MS, isTimeframe, type Timeframe, type UserSettings } from '../config/settings.ts';
 import type { RuntimeEnv } from '../config/env.ts';
 import { closedSeries, lastClosedStart, type Candle, type SeriesCheck } from '../domain/candles.ts';
 import { emaSeries } from '../domain/ema.ts';
@@ -719,7 +719,7 @@ export class Engine {
   /** The user ticks timeframes for a coin (mini app, /watch, /unwatch). */
   setCoinTimeframes(symbol: string, timeframes: readonly string[], actor: string): { ok: true; message: string } | { ok: false; reason: string } {
     const tfs = timeframes.filter(isTimeframe);
-    if (tfs.length !== timeframes.length) return { ok: false, reason: 'Unknown timeframe; use 5m, 15m, 1h or 4h.' };
+    if (tfs.length !== timeframes.length) return { ok: false, reason: `Unknown timeframe; use ${TIMEFRAMES.join(', ')}.` };
     const now = this.now();
     const res = editCoin(this.store.watchList(), this.universe, this.store.settings(), symbol, tfs, now);
     if (!res.ok) return res;

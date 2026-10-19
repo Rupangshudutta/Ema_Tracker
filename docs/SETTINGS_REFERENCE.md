@@ -45,9 +45,9 @@ Which coins the bot watches.
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
 | `volumeThresholdUsd` | Minimum 24 h trading volume for a coin to join or stay on the watchlist | $10M | $5M, $10M, $15M, $20M, $30M, $50M, $100M | Telegram menu | You |
-| `watchlist` | Each coin's ticked timeframes; a coin with none is removed and gets no alerts or live feed | Every coin above the filter on 15m | Per coin: any of 5m, 15m, 1h, 4h, or none | Mini app search | You |
+| `watchlist` | Each coin's ticked timeframes; a coin with none is removed and gets no alerts or live feed | Every coin above the filter on 15m | Per coin: any of 1m, 3m, 5m, 15m, 1h, 4h, or none | Mini app search | You |
 | `removedCoins` | Coins you removed; they stay out even while above the filter | none | Any coins | Mini app search | You |
-| `defaultTimeframes` | Timeframes a newly qualifying coin starts with | 15m | Any of 5m, 15m, 1h, 4h | Telegram menu | You |
+| `defaultTimeframes` | Timeframes a newly qualifying coin starts with | 15m | Any of 1m, 3m, 5m, 15m, 1h, 4h | Telegram menu | You |
 | `maxWatchlistCoins` | Most coins on the watchlist at once; extra coins are listed in a note | 16 | Fixed for the free plan | Config file in git | Nobody |
 | `universeRefreshMinutes` | How often the coin list is rebuilt from Delta volumes | 15 | Fixed | Config file in git | Nobody |
 | `dropGraceMinutes` | How long a coin must stay below the filter before it is dropped | 60 | Fixed | Config file in git | Nobody |
@@ -59,7 +59,7 @@ The EMA 9/15 rules.
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
 | `marginPct` | How far EMA 9 must pass EMA 15 before any alert; one value for every coin, timeframe and alert type | 0.05% | 0.00, 0.01, 0.02 ... 0.10% | Telegram menu | You |
-| `availableTimeframes` | Candle sizes the mini app offers | 5m, 15m, 1h, 4h | Fixed | Config file in git | Nobody |
+| `availableTimeframes` | Candle sizes the mini app offers | 1m, 3m, 5m, 15m, 1h, 4h | Fixed | Config file in git | Nobody |
 | `candleHistory` | Candles fetched per check (enough for exact EMAs) | 150 | Fixed | Config file in git | Nobody |
 | `rebuildHistory` | Candles fetched once if the remembered side is ever lost | 1000 | Fixed | Config file in git | Nobody |
 

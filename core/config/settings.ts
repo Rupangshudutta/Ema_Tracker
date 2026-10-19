@@ -4,10 +4,12 @@
 //   UserSettings values you change from Telegram; validated here before they are stored
 // Secrets and runtime switches are read from the environment in env.ts, never from this file.
 
-export const TIMEFRAMES = ['5m', '15m', '1h', '4h'] as const;
+export const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1h', '4h'] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
 export const TIMEFRAME_MS: Readonly<Record<Timeframe, number>> = {
+  '1m': 60_000,
+  '3m': 3 * 60_000,
   '5m': 5 * 60_000,
   '15m': 15 * 60_000,
   '1h': 60 * 60_000,

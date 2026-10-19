@@ -1,6 +1,7 @@
 // The coin picker, a Telegram mini app served at /app (S5). It lists coins above the volume filter plus the
 // watchlist, with a search bar and per-coin timeframe ticks. Each tap saves at once; the server checks the user's
 // Telegram signature, the volume filter and the 16-coin cap. Colours follow the user's Telegram theme.
+import { TIMEFRAMES } from '../config/settings.ts';
 
 export const MINI_APP_CSP = [
   "default-src 'none'",
@@ -51,11 +52,12 @@ export const MINI_APP_HTML = `<!doctype html>
   .badge.paused { color: #b7791f; border-color: #b7791f; }
   .stats { margin-left: auto; text-align: right; font-size: 12px; color: var(--hint); white-space: nowrap; }
   .pos { color: var(--up); } .neg { color: var(--down); }
-  .tfs { display: flex; gap: 6px; margin-top: 8px; }
-  .tf { flex: 1; min-height: 40px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
+  .tfs { display: grid; grid-template-columns: repeat(${TIMEFRAMES.length}, 1fr); gap: 6px; margin-top: 8px; }
+  .tf { min-width: 0; min-height: 40px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
   .tf.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   .tf:disabled { opacity: .5; }
-  .remove { margin-left: 4px; min-height: 40px; padding: 0 10px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--danger); font-size: 13px; }
+  .actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+  .remove { min-height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--danger); font-size: 13px; }
   .note { font-size: 12px; color: var(--hint); margin-top: 6px; }
   .empty { text-align: center; color: var(--hint); padding: 40px 16px; }
   #toast { position: fixed; left: 12px; right: 12px; bottom: calc(16px + env(safe-area-inset-bottom)); padding: 10px 14px; border-radius: 10px; background: #222; color: #fff; font-size: 14px; opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s; pointer-events: none; }
@@ -83,7 +85,7 @@ export const MINI_APP_HTML = `<!doctype html>
 
 export const MINI_APP_JS = String.raw`(function () {
   'use strict';
-  var TFS = ['5m', '15m', '1h', '4h'];
+  var TFS = ${JSON.stringify(TIMEFRAMES)};
   var tg = window.Telegram && window.Telegram.WebApp;
   var initData = tg ? tg.initData : '';
   var state = { coins: [], meta: null, query: '', filter: 'all', busy: {} };
@@ -177,9 +179,13 @@ export const MINI_APP_JS = String.raw`(function () {
         rm.type = 'button';
         rm.disabled = !!state.busy[c.symbol];
         rm.addEventListener('click', function () { save(c, []); });
-        row.appendChild(rm);
+        var actions = el('div', 'actions');
+        actions.appendChild(rm);
+        card.appendChild(row);
+        card.appendChild(actions);
+      } else {
+        card.appendChild(row);
       }
-      card.appendChild(row);
       if (c.status === 'paused') card.appendChild(el('div', 'note', 'Below the volume filter: alerts resume on these timeframes when volume recovers.'));
       if (c.status === 'removed') card.appendChild(el('div', 'note', 'You removed this coin. Tick a timeframe to add it back.'));
       list.appendChild(card);

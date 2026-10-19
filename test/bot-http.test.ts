@@ -141,6 +141,10 @@ describe('HTTP routes', () => {
     assert.equal((await handleHttp(new Request(`${BASE}/api/coins`), engine)).status, 401);
     const page = await handleHttp(new Request(`${BASE}/app`), engine);
     assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' https:\/\/telegram\.org/);
+    const script = await (await handleHttp(new Request(`${BASE}/app.js`), engine)).text();
+    assert.ok(script.includes('var TFS = ["1m","3m","5m","15m","1h","4h"];'), 'the coin picker offers all six timeframes');
+    const fast = await handleHttp(new Request(`${BASE}/api/coins`, { method: 'POST', headers, body: JSON.stringify({ symbol: 'ETHUSD', timeframes: ['1m', '3m'] }) }), engine);
+    assert.equal(fast.status, 200);
   });
 
   it('runtime sync needs the key derived from the bot token', async () => {
