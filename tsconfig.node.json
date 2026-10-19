@@ -12,6 +12,7 @@
   "include": [
     "core/**/*.ts",
     "test/**/*.ts",
-    "scripts/**/*.ts"
+    "scripts/**/*.ts",
+    "runtimes/docker/**/*.ts"
   ]
 }
