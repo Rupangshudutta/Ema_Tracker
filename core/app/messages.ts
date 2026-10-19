@@ -224,7 +224,7 @@ export function renderStatus(st: EngineStatus, now: number): string {
     `Coins: ${st.coins.active} watched · ${st.coins.paused} paused · ${st.coins.removed} removed · ${st.coins.series} coin-timeframes`,
     `Last candle check: ${st.lastMinuteAt === null ? 'not yet' : `${fmtDuration(now - st.lastMinuteAt)} ago`} · running since ${fmtDateTime(st.startedAt, tz)} ${tzLabel(tz)}`,
     st.delta.failingSince === null ? 'Delta API: ok' : `Delta API: <b>failing</b> for ${fmtDuration(now - st.delta.failingSince)} (${escapeHtml(st.delta.lastError ?? '')})`,
-    `Messages waiting: ${st.outbox.pending}`,
+    `Alerts since the daily report: ${st.alerts.found} found${st.alerts.heldBack ? `, ${st.alerts.heldBack} held back (paused or on standby)` : ''} · messages waiting: ${st.outbox.pending}`,
     paused !== null && paused > now ? `Alerts: ⏸ paused until ${fmtDateTime(paused, tz)} ${tzLabel(tz)}` : 'Alerts: on',
     settingsLine(st.settings)
   ].join('\n');

@@ -94,6 +94,21 @@ describe('runtime environment', () => {
     }
   });
 
+  it('forgives paste mistakes: quotes, the NAME= part and the bot prefix from the API URL', () => {
+    for (const pasted of [`"${fakeToken}"`, `'${fakeToken}'`, `TELEGRAM_BOT_TOKEN=${fakeToken}`, `bot${fakeToken}`, ` TELEGRAM_BOT_TOKEN = "${fakeToken}" `]) {
+      const r = parseRuntimeEnv({ TELEGRAM_BOT_TOKEN: pasted, TELEGRAM_CHAT_ID: '"987654321"' }, 'active');
+      assert.equal(r.ok && r.value.telegramBotToken, fakeToken, `pasted form: ${pasted.replace(fakeToken, '<token>')}`);
+      assert.equal(r.ok && r.value.telegramChatId, '987654321');
+    }
+  });
+
+  it('says whether a secret is missing or has the wrong format, and where to add it', () => {
+    const missing = parseRuntimeEnv({ TELEGRAM_CHAT_ID: '987654321' }, 'active');
+    assert.ok(!missing.ok && missing.errors[0]!.startsWith('TELEGRAM_BOT_TOKEN is missing: add it in Cloudflare'));
+    const wrong = parseRuntimeEnv({ TELEGRAM_BOT_TOKEN: 'my token', TELEGRAM_CHAT_ID: '987654321' }, 'active');
+    assert.ok(!wrong.ok && wrong.errors[0]!.startsWith('TELEGRAM_BOT_TOKEN is set but is not a bot token'));
+  });
+
   it('requires explicit admins for a group chat', () => {
     const r = parseRuntimeEnv({ ...good, TELEGRAM_CHAT_ID: '-1001234567890' }, 'active');
     assert.equal(r.ok, false);

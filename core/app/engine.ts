@@ -71,6 +71,8 @@ export interface EngineStatus {
   delta: { failingSince: number | null; lastError: string | null; backoffUntil: number | null };
   telegram: { lastError: string | null; lastErrorAt: number | null; blocked: boolean };
   outbox: { pending: number; oldestEventAt: number | null };
+  /** Alerts since the last daily report: all found, and those held back (paused, standby or Telegram not set up). */
+  alerts: { found: number; heldBack: number };
   settings: UserSettings;
   clockOffsetMs: number;
   healthy: boolean;
@@ -1100,11 +1102,21 @@ export class Engine {
       delta: { failingSince: this.restFailingSince, lastError: this.restLastError, backoffUntil: this.restBackoffUntil > now ? this.restBackoffUntil : null },
       telegram: { lastError: this.telegramLastError, lastErrorAt: this.telegramLastErrorAt, blocked: this.telegramBlocked },
       outbox: { pending: pending.count, oldestEventAt: pending.oldestEventAt },
+      alerts: this.alertCounts(),
       settings: this.store.settings(),
       clockOffsetMs: this.clockOffsetMs,
       healthy: this.role === 'active' && problems.length === 0,
       problems
     };
+  }
+
+  /** Stored counters plus the ones not yet flushed. */
+  private alertCounts(): { found: number; heldBack: number } {
+    const stored = this.store.peekStats();
+    const get = (key: string): number => (stored[key] ?? 0) + (this.counters[key] ?? 0);
+    const heldBack = get('alerts_suppressed');
+    const sent = get('alerts_confirmed') + get('alerts_realtime') + get('alerts_realtime_cancel') + get('alerts_not_confirmed');
+    return { found: sent + heldBack, heldBack };
   }
 
   private dailyReportIfDue(now: number): void {

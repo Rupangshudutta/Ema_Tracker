@@ -175,6 +175,8 @@ describe('engine on Cloudflare: watchlist, standby and reports', () => {
     const cross = expectedCross(turnUp(PIVOT), PIVOT - 300 * TF, PIVOT + 20 * TF);
     await runUntil(w, engine, cross + TF + 10_000);
     assert.equal(w.sent().length, 0);
+    const alerts = engine.status().alerts;
+    assert.ok(alerts.found >= 1 && alerts.heldBack === alerts.found, `found ${alerts.found}, held back ${alerts.heldBack}`);
   });
 
   it('sends the daily report at 09:00 India time once, and pings Healthchecks every 5 minutes', async () => {

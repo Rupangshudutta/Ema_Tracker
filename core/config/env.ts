@@ -19,6 +19,21 @@ const NUMERIC_ID = /^-?\d+$/;
 const BOT_TOKEN = /^\d+:[A-Za-z0-9_-]{30,}$/;
 const WEBHOOK_SECRET = /^[A-Za-z0-9_-]{1,256}$/;
 
+const WHERE = 'add it in Cloudflare (Settings > Variables and Secrets, type Secret), or in .env.docker for the Docker spare';
+
+/**
+ * Forgives the usual paste mistakes around a value: surrounding quotes, the "NAME=" part copied from a .env file,
+ * and stray whitespace. Never reports the value itself.
+ */
+function cleanPasted(value: string | undefined, name: string): string {
+  if (!value) return '';
+  return value
+    .trim()
+    .replace(new RegExp(`^${name}\\s*=\\s*`), '')
+    .replace(/^(["'`])(.*)\1$/s, '$2')
+    .trim();
+}
+
 function optionalHttpsUrl(raw: string | undefined, name: string, errors: string[]): string | null {
   if (!raw) return null;
   try {
@@ -42,11 +57,15 @@ export function parseRuntimeEnv(raw: Readonly<Record<string, string | undefined>
     return v ? v : undefined;
   };
 
-  const token = get('TELEGRAM_BOT_TOKEN') ?? '';
-  if (!BOT_TOKEN.test(token)) errors.push('TELEGRAM_BOT_TOKEN is missing or not in the <digits>:<key> format');
+  const tokenRaw = get('TELEGRAM_BOT_TOKEN');
+  const token = cleanPasted(tokenRaw, 'TELEGRAM_BOT_TOKEN').replace(/^bot(?=\d+:)/i, '');
+  if (!tokenRaw) errors.push(`TELEGRAM_BOT_TOKEN is missing: ${WHERE}`);
+  else if (!BOT_TOKEN.test(token)) errors.push('TELEGRAM_BOT_TOKEN is set but is not a bot token (expected <digits>:<key> exactly as @BotFather shows it)');
 
-  const chatId = get('TELEGRAM_CHAT_ID') ?? '';
-  if (!NUMERIC_ID.test(chatId)) errors.push('TELEGRAM_CHAT_ID is missing or not numeric');
+  const chatRaw = get('TELEGRAM_CHAT_ID');
+  const chatId = cleanPasted(chatRaw, 'TELEGRAM_CHAT_ID');
+  if (!chatRaw) errors.push(`TELEGRAM_CHAT_ID is missing: ${WHERE}`);
+  else if (!NUMERIC_ID.test(chatId)) errors.push('TELEGRAM_CHAT_ID is set but is not a number (your chat ID, for example 123456789)');
 
   const adminRaw = get('TELEGRAM_ADMIN_USER_IDS');
   const isGroupChat = chatId.startsWith('-');

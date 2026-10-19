@@ -67,7 +67,8 @@ function health(engine: Engine): Response {
     feed: { connected: st.feed.connected, coins: st.feed.wanted, quickDrops: st.feed.quickDrops },
     coins: st.coins,
     lastMinuteAt: st.lastMinuteAt === null ? null : new Date(st.lastMinuteAt).toISOString(),
-    pendingMessages: st.outbox.pending
+    pendingMessages: st.outbox.pending,
+    alertsSinceDailyReport: st.alerts
   };
   // A standby engine is healthy while its timer runs; an active one must also be free of problems.
   return json(body, stalled || (st.role === 'active' && !st.healthy) ? 503 : 200);
