@@ -31,25 +31,37 @@ function optionalHttpsUrl(raw: string | undefined, name: string, errors: string[
   }
 }
 
-export function parseRuntimeEnv(raw: Readonly<Record<string, string | undefined>>): EnvResult {
+/**
+ * `defaultRole` is the runtime's own safe default: 'active' on Cloudflare, 'standby' in Docker, so a container started
+ * without RUNTIME_ROLE never sends alerts alongside Cloudflare. Values are trimmed and an empty value counts as unset.
+ */
+export function parseRuntimeEnv(raw: Readonly<Record<string, string | undefined>>, defaultRole: RuntimeRole): EnvResult {
   const errors: string[] = [];
-  const token = raw.TELEGRAM_BOT_TOKEN ?? '';
+  const get = (name: string): string | undefined => {
+    const v = raw[name]?.trim();
+    return v ? v : undefined;
+  };
+
+  const token = get('TELEGRAM_BOT_TOKEN') ?? '';
   if (!BOT_TOKEN.test(token)) errors.push('TELEGRAM_BOT_TOKEN is missing or not in the <digits>:<key> format');
 
-  const chatId = raw.TELEGRAM_CHAT_ID ?? '';
+  const chatId = get('TELEGRAM_CHAT_ID') ?? '';
   if (!NUMERIC_ID.test(chatId)) errors.push('TELEGRAM_CHAT_ID is missing or not numeric');
 
-  const admins = (raw.TELEGRAM_ADMIN_USER_IDS ?? chatId).split(',').map(s => s.trim()).filter(Boolean);
+  const adminRaw = get('TELEGRAM_ADMIN_USER_IDS');
+  const isGroupChat = chatId.startsWith('-');
+  if (!adminRaw && isGroupChat) errors.push('TELEGRAM_ADMIN_USER_IDS is required when TELEGRAM_CHAT_ID is a group (a group ID never matches a user)');
+  const admins = (adminRaw ?? chatId).split(',').map(s => s.trim()).filter(Boolean);
   if (!admins.length || !admins.every(id => NUMERIC_ID.test(id))) errors.push('TELEGRAM_ADMIN_USER_IDS must be comma-separated numeric IDs');
 
-  const webhookSecret = raw.TELEGRAM_WEBHOOK_SECRET ?? null;
+  const webhookSecret = get('TELEGRAM_WEBHOOK_SECRET') ?? null;
   if (webhookSecret !== null && !WEBHOOK_SECRET.test(webhookSecret)) errors.push('TELEGRAM_WEBHOOK_SECRET may only contain letters, digits, _ and - (1 to 256 characters)');
 
-  const role = raw.RUNTIME_ROLE ?? 'active';
+  const role = get('RUNTIME_ROLE') ?? defaultRole;
   if (role !== 'active' && role !== 'standby') errors.push('RUNTIME_ROLE must be active or standby');
 
-  const healthcheckPingUrl = optionalHttpsUrl(raw.HEALTHCHECK_PING_URL, 'HEALTHCHECK_PING_URL', errors);
-  const publicBaseUrl = optionalHttpsUrl(raw.PUBLIC_BASE_URL, 'PUBLIC_BASE_URL', errors);
+  const healthcheckPingUrl = optionalHttpsUrl(get('HEALTHCHECK_PING_URL'), 'HEALTHCHECK_PING_URL', errors);
+  const publicBaseUrl = optionalHttpsUrl(get('PUBLIC_BASE_URL'), 'PUBLIC_BASE_URL', errors);
 
   if (errors.length) return { ok: false, errors };
   return {

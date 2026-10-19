@@ -11,6 +11,16 @@ export type FeedEvent =
   | { type: 'ignored'; reason: string };
 
 const CHANNEL = SYSTEM.realtime.channel;
+// Plausible ticker times in microseconds: 2020-01-01 to 2100-01-01. Rejects 0, 1970 dates and unit mistakes.
+const MIN_TIMESTAMP_US = Date.UTC(2020, 0, 1) * 1000;
+const MAX_TIMESTAMP_US = Date.UTC(2100, 0, 1) * 1000;
+
+/** A finite number, or a plain decimal string; anything else (booleans, hex, "Infinity", arrays) is NaN. */
+function strictNumber(v: unknown): number {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : Number.NaN;
+  if (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v.trim())) return Number(v);
+  return Number.NaN;
+}
 
 function channelSymbols(m: Record<string, unknown>): string[] {
   const channels = Array.isArray(m.channels) ? m.channels : [];
@@ -33,10 +43,11 @@ export function parseFeedMessage(raw: string): FeedEvent {
   const msg = m as Record<string, unknown>;
   switch (msg.type) {
     case CHANNEL: {
-      const price = typeof msg.close === 'number' ? msg.close : Number(msg.close);
-      const ts = typeof msg.timestamp === 'number' ? msg.timestamp : Number(msg.timestamp);
-      if (typeof msg.symbol !== 'string' || !(price > 0) || !Number.isFinite(ts)) return { type: 'ignored', reason: 'ticker without symbol, price or time' };
-      return { type: 'ticker', symbol: msg.symbol, price, timestampMs: Math.floor(ts / 1000) };
+      const price = strictNumber(msg.close);
+      const tsMicros = strictNumber(msg.timestamp);
+      if (typeof msg.symbol !== 'string' || !msg.symbol || !(price > 0)) return { type: 'ignored', reason: 'ticker without symbol or price' };
+      if (!(tsMicros >= MIN_TIMESTAMP_US && tsMicros <= MAX_TIMESTAMP_US)) return { type: 'ignored', reason: 'ticker without a plausible timestamp' };
+      return { type: 'ticker', symbol: msg.symbol, price, timestampMs: Math.floor(tsMicros / 1000) };
     }
     case 'subscriptions':
       return { type: 'subscribed', symbols: channelSymbols(msg) };

@@ -99,6 +99,29 @@ describe('DeltaClient (recorded replies)', () => {
     assert.deepEqual(!third.ok && third.error, { kind: 'http', status: 403 });
   });
 
+  it('retries a reply whose body breaks mid-download, and only calls unparseable text a bad response (review #2)', async () => {
+    const brokenBody = (err: Error): Response => {
+      const res = new Response('{}', { status: 200 });
+      Object.defineProperty(res, 'text', { value: () => Promise.reject(err) });
+      return res;
+    };
+    const reset = new TypeError('terminated');
+    const stalled = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+    const { fetch, calls } = replay([brokenBody(reset), brokenBody(stalled), json(sample('tickers'))]);
+    const r = await new DeltaClient(fetch, noSleep).tickers();
+    assert.equal(r.ok, true);
+    assert.equal(calls.length, 3);
+    const allBroken = replay([brokenBody(stalled), brokenBody(stalled), brokenBody(stalled), brokenBody(stalled)]);
+    assert.deepEqual(await new DeltaClient(allBroken.fetch, noSleep).tickers(), { ok: false, error: { kind: 'timeout' }, attempts: SYSTEM.exchange.maxRetries + 1 });
+  });
+
+  it('flags when the time came from the local clock instead of Delta (review #14)', async () => {
+    const withDate = await new DeltaClient(replay([json(sample('tickers'))]).fetch, noSleep).tickers();
+    assert.equal(withDate.ok && withDate.serverClock, true);
+    const noDate = await new DeltaClient(replay([new Response(JSON.stringify(sample('tickers').body), { status: 200 })]).fetch, noSleep).tickers();
+    assert.equal(noDate.ok && noDate.serverClock, false);
+  });
+
   it('drops ticker rows that fail validation', () => {
     assert.equal(parseTicker({ symbol: 'X', close: 0, turnover_usd: 1 }), null);
     assert.equal(parseTicker({ close: 5, turnover_usd: 1 }), null);
@@ -122,6 +145,12 @@ describe('live feed messages (recorded)', () => {
   it('ignores junk and reports errors', () => {
     assert.equal(parseFeedMessage('not json').type, 'ignored');
     assert.equal(parseFeedMessage('{"type":"v2/ticker","symbol":"X"}').type, 'ignored');
+    const ok = { type: 'v2/ticker', symbol: 'BTCUSD', close: 82000.5, timestamp: 1792410675105086 };
+    assert.equal(parseFeedMessage(JSON.stringify(ok)).type, 'ticker');
+    assert.equal(parseFeedMessage(JSON.stringify({ ...ok, close: '82000.5' })).type, 'ticker');
+    for (const bad of [{ close: true }, { close: '0x10' }, { close: 'Infinity' }, { close: -1 }, { timestamp: null }, { timestamp: '' }, { timestamp: [] }, { timestamp: 1_000_000 }, { symbol: '' }]) {
+      assert.equal(parseFeedMessage(JSON.stringify({ ...ok, ...bad })).type, 'ignored', JSON.stringify(bad));
+    }
     assert.deepEqual(parseFeedMessage('{"type":"error","message":"bad symbol"}'), { type: 'error', message: 'bad symbol' });
   });
 

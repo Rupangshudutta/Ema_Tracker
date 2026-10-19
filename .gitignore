@@ -27,3 +27,6 @@ alert_state
 .wrangler/
 .dev.vars
 .dev.vars.*
+
+# Template listing the secret names (no values); must stay tracked
+!.dev.vars.example

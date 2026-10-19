@@ -56,17 +56,28 @@ describe('closedSeries (audit fix I1)', () => {
     assert.equal(r.ok ? 'ok' : r.problem, 'stale');
   });
 
-  it('reports gaps, duplicates, off-grid starts and bad prices', () => {
+  it('keeps the clean recent run after a gap, bad close, off-grid start or conflicting duplicate (review #4)', () => {
+    const base = candlesFrom(Array.from({ length: 13 }, (_, i) => 100 + i), first, MIN5); // 09:00 .. 10:00
+    const lengthOf = (rows: typeof base, min = 1): number | string => (r => (r.ok ? r.candles.length : r.problem))(closedSeries(rows, MIN5, now, min));
+    assert.equal(lengthOf(base.filter((_, i) => i !== 5)), 7); // gap after index 4: keep 6..12
+    assert.equal(lengthOf(base.filter((_, i) => i !== 5), 13), 'gap'); // too short for the caller's minimum
+    assert.equal(lengthOf(base.map((c, i) => (i === 4 ? { ...c, close: Number.NaN } : c))), 8);
+    assert.equal(lengthOf(base.map((c, i) => (i === 2 ? { ...c, start: c.start + 1000 } : c))), 10);
+    assert.equal(lengthOf([...base, { ...base[3]!, close: 1 }]), 9); // conflicting duplicate of index 3
+    assert.equal(lengthOf([...base, { ...base[3]! }]), 13); // identical duplicate is ignored
+  });
+
+  it('ignores bad open, high, low or volume because the signal only uses the close', () => {
     const base = candlesFrom(Array.from({ length: 13 }, (_, i) => 100 + i), first, MIN5);
-    const gap = base.filter((_, i) => i !== 5);
-    assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries(gap, MIN5, now)), 'gap');
-    const dup = [...base, { ...base[3]! }];
-    assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries(dup, MIN5, now)), 'invalid');
-    const offGrid = base.map((c, i) => (i === 2 ? { ...c, start: c.start + 1000 } : c));
-    assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries(offGrid, MIN5, now)), 'invalid');
-    const bad = base.map((c, i) => (i === 4 ? { ...c, close: Number.NaN } : c));
-    assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries(bad, MIN5, now)), 'invalid');
+    const r = closedSeries(base.map((c, i) => (i === 0 ? { ...c, open: Number.NaN, volume: -1 } : c)), MIN5, now);
+    assert.equal(r.ok && r.candles.length, 13);
+    assert.equal(r.ok && r.dropped, 0);
+  });
+
+  it('rejects an empty response and an unusable just-closed candle', () => {
+    const base = candlesFrom(Array.from({ length: 13 }, (_, i) => 100 + i), first, MIN5);
     assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries([], MIN5, now)), 'empty');
+    assert.equal((r => (r.ok ? 'ok' : r.problem))(closedSeries(base.map((c, i) => (i === 12 ? { ...c, close: 0 } : c)), MIN5, now)), 'invalid');
   });
 
   it('computes the last closed candle for every timeframe on the UTC grid', () => {

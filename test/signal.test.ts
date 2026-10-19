@@ -55,7 +55,7 @@ describe('evaluateConfirmed', () => {
     const before = evaluateConfirmed(candles.slice(0, 160), PAIR, 0.05, null, T0);
     // The remembered candle (index 159) sits at index 99 of this window, past the 90-candle EMA run-in.
     const after = evaluateConfirmed(candles.slice(60, 210), PAIR, 0.05, before.state, before.state!.lastCloseStart);
-    assert.equal(after.rebuilt, false);
+    assert.equal(after.status, 'advanced');
     const full = evaluateConfirmed(candles.slice(0, 210), PAIR, 0.05, null, before.state!.lastCloseStart);
     assert.ok(full.crosses.length >= 1, 'the wave must cross in the evaluated range');
     assert.deepEqual(after.crosses.map(c => [c.candleStart, c.direction]), full.crosses.map(c => [c.candleStart, c.direction]));
@@ -69,16 +69,28 @@ describe('evaluateConfirmed', () => {
     assert.equal(stale.state, prior);
     assert.equal(stale.crosses.length, 0);
     const far: SignalState = { ...prior, lastCloseStart: T0 - 10 * MIN5 };
-    assert.equal(evaluateConfirmed(candles, PAIR, 0.05, far, 0).rebuilt, true);
+    assert.equal(evaluateConfirmed(candles, PAIR, 0.05, far, 0).status, 'rebuilt');
+    assert.equal(stale.status, 'no-new-candle');
+  });
+
+  it('rebuilds instead of trusting a side computed with a different margin (review #3)', () => {
+    const candles = candlesFrom(WAVE, T0, MIN5);
+    const before = evaluateConfirmed(candles.slice(0, 160), PAIR, 0.01, null, T0);
+    const changed = evaluateConfirmed(candles.slice(60, 210), PAIR, 0.1, before.state, before.state!.lastCloseStart);
+    assert.equal(changed.status, 'rebuilt');
+    assert.equal(changed.state?.marginPct, 0.1);
+    // Same margin, no new candle: kept as is. Different margin, no new candle: rebuilt, never silently reused.
+    assert.equal(evaluateConfirmed(candles.slice(0, 160), PAIR, 0.01, before.state, 0).status, 'no-new-candle');
+    assert.equal(evaluateConfirmed(candles.slice(0, 160), PAIR, 0.1, before.state, Number.POSITIVE_INFINITY).status, 'rebuilt');
   });
 
   it('needs at least slow-period candles', () => {
-    assert.deepEqual(evaluateConfirmed(candlesFrom([1, 2, 3], T0, MIN5), PAIR, 0, null, 0), { crosses: [], state: null, rebuilt: false });
+    assert.deepEqual(evaluateConfirmed(candlesFrom([1, 2, 3], T0, MIN5), PAIR, 0, null, 0), { crosses: [], state: null, status: 'too-short' });
   });
 });
 
 describe('evaluateRealtime', () => {
-  const below: SignalState = { side: 'below', lastCloseStart: T0, emaFast: 99.9, emaSlow: 100 };
+  const below: SignalState = { side: 'below', marginPct: 0.05, lastCloseStart: T0, emaFast: 99.9, emaSlow: 100 };
   const open = (): ReturnType<typeof newRealtimeCandle> => newRealtimeCandle(T0 + MIN5);
 
   it('alerts once per candle when the live gap passes the margin', () => {
@@ -105,11 +117,17 @@ describe('evaluateRealtime', () => {
 
   it('stays quiet without a confirmed side or with a state that is not the previous candle', () => {
     assert.deepEqual(evaluateRealtime({ ...below, side: null }, open(), MIN5, 120, PAIR, 0).action, { kind: 'none', reason: 'no-side' });
-    assert.deepEqual(evaluateRealtime(below, newRealtimeCandle(T0 + 2 * MIN5), MIN5, 120, PAIR, 0).action, { kind: 'none', reason: 'stale-state' });
+    assert.deepEqual(evaluateRealtime(below, newRealtimeCandle(T0 + 2 * MIN5), MIN5, 120, PAIR, 0.05).action, { kind: 'none', reason: 'stale-state' });
+  });
+
+  it('stays quiet when the margin changed since the confirmed side was computed, and on a bad price', () => {
+    assert.deepEqual(evaluateRealtime(below, open(), MIN5, 120, PAIR, 0.1).action, { kind: 'none', reason: 'stale-state' });
+    assert.equal(evaluateRealtime(below, open(), MIN5, Number.NaN, PAIR, 0.05).action.kind, 'none');
+    assert.equal(evaluateRealtime(below, open(), MIN5, Number.POSITIVE_INFINITY, PAIR, 0.05).action.kind, 'none');
   });
 
   it('uses the same EMA step as the confirmed rule', () => {
-    const r = evaluateRealtime(below, open(), MIN5, 101.5, PAIR, 0);
+    const r = evaluateRealtime({ ...below, marginPct: 0 }, open(), MIN5, 101.5, PAIR, 0);
     if (r.action.kind !== 'alert') throw new Error('expected an alert');
     assert.ok(Math.abs(r.action.spreadPct - spreadPct(r.action.emaFast, r.action.emaSlow)) < 1e-12);
   });
@@ -118,10 +136,18 @@ describe('evaluateRealtime', () => {
 describe('closeOutcome', () => {
   const cross = { direction: 'up', candleStart: T0, close: 1, emaFast: 1, emaSlow: 1, spreadPct: 0.2 } as const;
   it('covers every combination', () => {
-    assert.equal(closeOutcome({ candleStart: T0, alerted: 'up', cancelled: false }, cross), 'confirmed-after-realtime');
-    assert.equal(closeOutcome(null, cross), 'confirmed');
-    assert.equal(closeOutcome({ candleStart: T0, alerted: 'up', cancelled: false }, null), 'realtime-not-confirmed');
-    assert.equal(closeOutcome({ candleStart: T0, alerted: 'up', cancelled: true }, null), 'realtime-cancelled');
-    assert.equal(closeOutcome({ candleStart: T0, alerted: null, cancelled: false }, null), 'nothing');
+    assert.equal(closeOutcome(T0, { candleStart: T0, alerted: 'up', cancelled: false }, cross), 'confirmed-after-realtime');
+    assert.equal(closeOutcome(T0, { candleStart: T0, alerted: 'up', cancelled: true }, cross), 'confirmed-after-cancel');
+    assert.equal(closeOutcome(T0, null, cross), 'confirmed');
+    assert.equal(closeOutcome(T0, { candleStart: T0, alerted: 'up', cancelled: false }, null), 'realtime-not-confirmed');
+    assert.equal(closeOutcome(T0, { candleStart: T0, alerted: 'up', cancelled: true }, null), 'realtime-cancelled');
+    assert.equal(closeOutcome(T0, { candleStart: T0, alerted: null, cancelled: false }, null), 'nothing');
+  });
+
+  it('ignores realtime records and crosses from other candles (review #9)', () => {
+    const earlier = { candleStart: T0 - 3 * MIN5, alerted: 'up', cancelled: false } as const;
+    assert.equal(closeOutcome(T0, earlier, cross), 'confirmed');
+    assert.equal(closeOutcome(T0, earlier, null), 'nothing');
+    assert.equal(closeOutcome(T0 + MIN5, null, cross), 'nothing');
   });
 });

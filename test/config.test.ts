@@ -31,6 +31,15 @@ describe('user settings', () => {
     if (!r.ok) assert.deepEqual(r.errors.sort(), ['unknown group: other', 'unknown setting: coins.extra']);
   });
 
+  it('rejects prototype-chain keys, empty timeframe lists, and stores exact canonical numbers (review #7, #8)', () => {
+    assert.equal(validateUserSettings({ constructor: 1 }).ok, false);
+    assert.equal(validateUserSettings(JSON.parse('{"__proto__":{}}')).ok, false);
+    assert.equal(validateUserSettings({ coins: { toString: 1 } }).ok, false);
+    assert.equal(validateUserSettings({ coins: { defaultTimeframes: [] } }).ok, false);
+    const r = validateUserSettings({ signal: { marginPct: 0.05 + 5e-10 } });
+    assert.equal(r.ok && r.value.signal.marginPct, 0.05);
+  });
+
   it('sorts timeframes, rejects duplicates, validates time and zone', () => {
     const r = validateUserSettings({ coins: { defaultTimeframes: ['4h', '5m', '15m'] } });
     assert.equal(r.ok && r.value.coins.defaultTimeframes.join(','), '5m,15m,4h');
@@ -47,7 +56,7 @@ describe('runtime environment', () => {
   const good = { TELEGRAM_BOT_TOKEN: fakeToken, TELEGRAM_CHAT_ID: '987654321' };
 
   it('parses the minimum and defaults admins to the chat and role to active', () => {
-    const r = parseRuntimeEnv(good);
+    const r = parseRuntimeEnv(good, 'active');
     assert.equal(r.ok, true);
     if (r.ok) {
       assert.deepEqual(r.value.adminUserIds, ['987654321']);
@@ -57,11 +66,37 @@ describe('runtime environment', () => {
   });
 
   it('names missing or malformed variables without echoing their values', () => {
-    const r = parseRuntimeEnv({ TELEGRAM_BOT_TOKEN: 'not-a-token-value', TELEGRAM_CHAT_ID: 'abc', RUNTIME_ROLE: 'primary', HEALTHCHECK_PING_URL: 'http://insecure.example' });
+    const r = parseRuntimeEnv({ TELEGRAM_BOT_TOKEN: 'not-a-token-value', TELEGRAM_CHAT_ID: 'abc', RUNTIME_ROLE: 'primary', HEALTHCHECK_PING_URL: 'http://insecure.example' }, 'active');
     assert.equal(r.ok, false);
     if (!r.ok) {
       assert.equal(r.errors.length, 5);
       assert.ok(r.errors.every(e => !e.includes('not-a-token-value') && !e.includes('insecure.example')));
     }
+  });
+
+  it("uses the runtime's own default role so a bare Docker container stays quiet (review #5)", () => {
+    const r = parseRuntimeEnv(good, 'standby');
+    assert.equal(r.ok && r.value.role, 'standby');
+    assert.equal((x => x.ok && x.value.role)(parseRuntimeEnv({ ...good, RUNTIME_ROLE: 'active' }, 'standby')), 'active');
+  });
+
+  it('treats empty values as unset and trims whitespace (review #6)', () => {
+    const r = parseRuntimeEnv({ TELEGRAM_BOT_TOKEN: ` ${fakeToken}
+`, TELEGRAM_CHAT_ID: ' 987654321 ', TELEGRAM_ADMIN_USER_IDS: '', TELEGRAM_WEBHOOK_SECRET: '', RUNTIME_ROLE: '', HEALTHCHECK_PING_URL: '' }, 'active');
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.value.telegramBotToken, fakeToken);
+      assert.equal(r.value.telegramChatId, '987654321');
+      assert.deepEqual(r.value.adminUserIds, ['987654321']);
+      assert.equal(r.value.telegramWebhookSecret, null);
+      assert.equal(r.value.healthcheckPingUrl, null);
+      assert.equal(r.value.role, 'active');
+    }
+  });
+
+  it('requires explicit admins for a group chat', () => {
+    const r = parseRuntimeEnv({ ...good, TELEGRAM_CHAT_ID: '-1001234567890' }, 'active');
+    assert.equal(r.ok, false);
+    assert.equal(parseRuntimeEnv({ ...good, TELEGRAM_CHAT_ID: '-1001234567890', TELEGRAM_ADMIN_USER_IDS: '987654321' }, 'active').ok, true);
   });
 });

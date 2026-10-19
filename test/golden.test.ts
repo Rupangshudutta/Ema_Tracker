@@ -50,7 +50,7 @@ describe('golden: recorded Delta India candles', () => {
         for (let i = EVAL_FROM; i < f.candles.length; i++) {
           const window = f.candles.slice(i - SYSTEM.signal.candleHistory + 1, i + 1);
           const r = evaluateConfirmed(window, PAIR, margin, state, f.candles[i - 1]!.start);
-          assert.equal(r.rebuilt, false, `${f.symbol} ${f.timeframe} rebuilt at ${i}`);
+          assert.equal(r.status, 'advanced', `${f.symbol} ${f.timeframe} at ${i}`);
           incremental.push(...r.crosses.map(key));
           state = r.state;
         }

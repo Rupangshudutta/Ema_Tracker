@@ -28,7 +28,8 @@ export type DeltaFailure =
   | { kind: 'timeout' }
   | { kind: 'bad-response'; message: string };
 
-export type DeltaResult<T> = { ok: true; value: T; serverNow: number } | { ok: false; error: DeltaFailure; attempts: number };
+/** serverClock is true when serverNow came from Delta's Date header, false when it fell back to the local clock. */
+export type DeltaResult<T> = { ok: true; value: T; serverNow: number; serverClock: boolean } | { ok: false; error: DeltaFailure; attempts: number };
 
 export interface DeltaClientOptions {
   restBase: string;
@@ -100,7 +101,7 @@ export class DeltaClient {
       if (t) tickers.push(t);
       else rejected++;
     }
-    return { ok: true, value: { tickers, rejected }, serverNow: r.serverNow };
+    return { ok: true, value: { tickers, rejected }, serverNow: r.serverNow, serverClock: r.serverClock };
   }
 
   /** Raw candles for one symbol (forming candle included, any order). Apply closedSeries() with `serverNow`. */
@@ -117,7 +118,7 @@ export class DeltaClient {
       const c = row as Record<string, unknown>;
       candles.push({ start: num(c.time) * 1000, open: num(c.open), high: num(c.high), low: num(c.low), close: num(c.close), volume: num(c.volume) });
     }
-    return { ok: true, value: candles, serverNow: r.serverNow };
+    return { ok: true, value: candles, serverNow: r.serverNow, serverClock: r.serverClock };
   }
 
   private async request(path: string): Promise<DeltaResult<unknown[]>> {
@@ -146,19 +147,29 @@ export class DeltaClient {
         continue;
       }
       if (!res.ok) return { ok: false, error: { kind: 'http', status: res.status }, attempts: attempt };
+      // Read the body as text first: a stalled or reset download is a transient network fault (retry), while text
+      // that is not JSON, or JSON of the wrong shape, is a real bad response (do not retry).
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (err) {
+        const name = err instanceof Error ? err.name : '';
+        lastError = name === 'TimeoutError' || name === 'AbortError' ? { kind: 'timeout' } : { kind: 'network', message: `body: ${describe(err)}` };
+        continue;
+      }
       let body: unknown;
       try {
-        body = await res.json();
-      } catch (err) {
-        return { ok: false, error: { kind: 'bad-response', message: `invalid JSON: ${describe(err)}` }, attempts: attempt };
+        body = JSON.parse(text);
+      } catch {
+        return { ok: false, error: { kind: 'bad-response', message: 'reply is not JSON' }, attempts: attempt };
       }
       const envelope = body as { success?: unknown; result?: unknown };
       if (envelope?.success !== true || !Array.isArray(envelope.result)) {
         return { ok: false, error: { kind: 'bad-response', message: 'missing success flag or result list' }, attempts: attempt };
       }
-      const date = res.headers.get('date');
-      const serverNow = date ? Date.parse(date) : Number.NaN;
-      return { ok: true, value: envelope.result, serverNow: Number.isFinite(serverNow) ? serverNow : Date.now() };
+      const date = Date.parse(res.headers.get('date') ?? '');
+      const serverClock = Number.isFinite(date);
+      return { ok: true, value: envelope.result, serverNow: serverClock ? date : Date.now(), serverClock };
     }
     return { ok: false, error: lastError, attempts: attempt };
   }

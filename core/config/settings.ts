@@ -96,7 +96,8 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; errors: string[] };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
-const inList = (v: unknown, list: readonly number[]): v is number => typeof v === 'number' && list.some(x => Math.abs(x - v) < 1e-9);
+/** The list element equal to v (within float noise), so stored values are always the exact canonical option. */
+const canonical = (v: unknown, list: readonly number[]): number | undefined => (typeof v === 'number' ? list.find(x => Math.abs(x - v) < 1e-9) : undefined);
 
 export function isTimeframe(v: unknown): v is Timeframe {
   return typeof v === 'string' && (TIMEFRAMES as readonly string[]).includes(v);
@@ -125,7 +126,7 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
     delivery: ['pausedUntil'],
     monitoring: ['dailyReportTime', 'timeZone']
   };
-  for (const key of Object.keys(input)) if (!(key in known)) errors.push(`unknown group: ${key}`);
+  for (const key of Object.keys(input)) if (!Object.hasOwn(known, key)) errors.push(`unknown group: ${key}`);
   const group = (name: keyof UserSettings): Record<string, unknown> => {
     const g = input[name];
     if (g === undefined) return {};
@@ -143,17 +144,17 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
   const delivery = group('delivery');
   const monitoring = group('monitoring');
 
-  const volume = coins.volumeThresholdUsd ?? d.coins.volumeThresholdUsd;
-  if (!inList(volume, VOLUME_OPTIONS_USD)) errors.push(`coins.volumeThresholdUsd must be one of ${VOLUME_OPTIONS_USD.join(', ')}`);
+  const volume = canonical(coins.volumeThresholdUsd ?? d.coins.volumeThresholdUsd, VOLUME_OPTIONS_USD);
+  if (volume === undefined) errors.push(`coins.volumeThresholdUsd must be one of ${VOLUME_OPTIONS_USD.join(', ')}`);
 
   const tfs = coins.defaultTimeframes ?? d.coins.defaultTimeframes;
   const tfList = Array.isArray(tfs) ? tfs : [];
-  if (!Array.isArray(tfs) || !tfList.every(isTimeframe) || new Set(tfList).size !== tfList.length) {
-    errors.push(`coins.defaultTimeframes must be distinct values from ${TIMEFRAMES.join(', ')}`);
+  if (!Array.isArray(tfs) || !tfList.length || !tfList.every(isTimeframe) || new Set(tfList).size !== tfList.length) {
+    errors.push(`coins.defaultTimeframes must be one or more distinct values from ${TIMEFRAMES.join(', ')}`);
   }
 
-  const margin = signal.marginPct ?? d.signal.marginPct;
-  if (!inList(margin, MARGIN_OPTIONS_PCT)) errors.push(`signal.marginPct must be one of ${MARGIN_OPTIONS_PCT.join(', ')}`);
+  const margin = canonical(signal.marginPct ?? d.signal.marginPct, MARGIN_OPTIONS_PCT);
+  if (margin === undefined) errors.push(`signal.marginPct must be one of ${MARGIN_OPTIONS_PCT.join(', ')}`);
 
   const cancelNotes = realtime.cancelNotes ?? d.realtime.cancelNotes;
   if (typeof cancelNotes !== 'boolean') errors.push('realtime.cancelNotes must be true or false');
@@ -173,8 +174,8 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
   return {
     ok: true,
     value: {
-      coins: { volumeThresholdUsd: volume as number, defaultTimeframes: [...(tfList as Timeframe[])].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]) },
-      signal: { marginPct: margin as number },
+      coins: { volumeThresholdUsd: volume!, defaultTimeframes: [...(tfList as Timeframe[])].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]) },
+      signal: { marginPct: margin! },
       realtime: { cancelNotes: cancelNotes as boolean },
       delivery: { pausedUntil: pausedUntil as number | null },
       monitoring: { dailyReportTime: reportTime as string, timeZone: tz as string }

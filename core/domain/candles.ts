@@ -12,9 +12,10 @@ export interface Candle {
 }
 
 export type SeriesProblem = 'empty' | 'invalid' | 'gap' | 'stale';
-export type SeriesCheck = { ok: true; candles: Candle[] } | { ok: false; problem: SeriesProblem; detail: string };
+export type SeriesCheck = { ok: true; candles: Candle[]; dropped: number } | { ok: false; problem: SeriesProblem; detail: string };
 
-const finitePositive = (n: number): boolean => Number.isFinite(n) && n > 0;
+/** The signal only uses start and close, so only those decide whether a candle is usable. */
+const usable = (c: Candle, intervalMs: number): boolean => c.start % intervalMs === 0 && Number.isFinite(c.close) && c.close > 0;
 
 /** Start of the most recent candle that has closed at `nowMs`. */
 export function lastClosedStart(nowMs: number, intervalMs: number): number {
@@ -22,28 +23,38 @@ export function lastClosedStart(nowMs: number, intervalMs: number): number {
 }
 
 /**
- * Keeps candles with start + interval <= nowMs (nowMs must be exchange or trusted server time), sorts them ascending,
- * and rejects the series if a price is invalid, a start repeats or is off-grid, a candle is missing in between,
- * or the newest closed candle is not the one that just closed (the exchange has not published it yet).
+ * Keeps candles with start + interval <= nowMs (nowMs must be exchange or trusted server time) and returns the longest
+ * run of contiguous, usable candles that ends at the candle that just closed. Anything older than the first gap,
+ * off-grid start, bad close or conflicting duplicate (walking back from the newest) is dropped and counted, so one bad
+ * old candle cannot mute a coin. Fails if the just-closed candle is not there yet ('stale'), is itself unusable
+ * ('invalid'), or the clean run is shorter than `minCandles` ('gap').
  */
-export function closedSeries(rows: readonly Candle[], intervalMs: number, nowMs: number): SeriesCheck {
-  const closed = rows.filter(c => c.start + intervalMs <= nowMs).sort((a, b) => a.start - b.start);
+export function closedSeries(rows: readonly Candle[], intervalMs: number, nowMs: number, minCandles = 1): SeriesCheck {
+  const closed = rows.filter(c => Number.isFinite(c.start) && c.start + intervalMs <= nowMs).sort((a, b) => a.start - b.start);
   if (!closed.length) return { ok: false, problem: 'empty', detail: 'no closed candles in response' };
-  for (const c of closed) {
-    if (c.start % intervalMs !== 0) return { ok: false, problem: 'invalid', detail: `candle ${c.start} is not on the ${intervalMs} ms grid` };
-    if (![c.open, c.high, c.low, c.close].every(finitePositive) || !(Number.isFinite(c.volume) && c.volume >= 0)) {
-      return { ok: false, problem: 'invalid', detail: `candle ${new Date(c.start).toISOString()} has a non-positive or non-numeric value` };
-    }
-  }
-  for (let i = 1; i < closed.length; i++) {
-    const step = closed[i]!.start - closed[i - 1]!.start;
-    if (step === 0) return { ok: false, problem: 'invalid', detail: `duplicate candle ${new Date(closed[i]!.start).toISOString()}` };
-    if (step !== intervalMs) return { ok: false, problem: 'gap', detail: `missing candles after ${new Date(closed[i - 1]!.start).toISOString()}` };
-  }
+
   const expected = lastClosedStart(nowMs, intervalMs);
-  const newest = closed[closed.length - 1]!.start;
-  if (newest !== expected) {
-    return { ok: false, problem: 'stale', detail: `newest closed candle is ${new Date(newest).toISOString()}, expected ${new Date(expected).toISOString()}` };
+  const newest = closed[closed.length - 1]!;
+  if (newest.start !== expected) {
+    return { ok: false, problem: 'stale', detail: `newest closed candle is ${new Date(newest.start).toISOString()}, expected ${new Date(expected).toISOString()}` };
   }
-  return { ok: true, candles: closed };
+  if (!usable(newest, intervalMs)) return { ok: false, problem: 'invalid', detail: `the just-closed candle ${new Date(newest.start).toISOString()} has no usable close` };
+
+  const run: Candle[] = [newest];
+  for (let i = closed.length - 2; i >= 0; i--) {
+    const c = closed[i]!;
+    const earliest = run[run.length - 1]!;
+    if (c.start === earliest.start) {
+      if (c.close === earliest.close) continue; // identical duplicate row
+      run.pop(); // conflicting duplicate: trust neither copy, nor anything older
+      break;
+    }
+    if (earliest.start - c.start !== intervalMs || !usable(c, intervalMs)) break;
+    run.push(c);
+  }
+  run.reverse();
+  if (run.length < minCandles) {
+    return { ok: false, problem: 'gap', detail: `only ${run.length} clean candles up to ${new Date(newest.start).toISOString()} (need ${minCandles})` };
+  }
+  return { ok: true, candles: run, dropped: closed.length - run.length };
 }
