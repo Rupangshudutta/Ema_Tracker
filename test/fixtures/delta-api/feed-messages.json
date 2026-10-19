@@ -1,0 +1,82 @@
+{
+ "subscriptions": {
+  "channels": [
+   {
+    "name": "v2/ticker",
+    "symbols": [
+     "BTCUSD"
+    ]
+   }
+  ],
+  "type": "subscriptions"
+ },
+ "v2/ticker": {
+  "mark_low_24h": "80661.22857214",
+  "mark_change_24h": "0.3889",
+  "oi_contracts": "800776",
+  "product_trading_status": "operational",
+  "size": 11121213,
+  "timestamp": 1792410675105086,
+  "open": 82001,
+  "oi_change_usd_6h": "-420751.3200",
+  "sort_priority": 1,
+  "oi_value": "800.7760",
+  "close": 82302,
+  "type": "v2/ticker",
+  "mark_basis": "-0.00049831",
+  "mark_high_24h": "83122.96780245",
+  "high": 83133.5,
+  "low": 80647.5,
+  "description": "Bitcoin Perpetual",
+  "quotes": {
+   "ask_iv": null,
+   "ask_size": "483",
+   "best_ask": "82300.5",
+   "best_bid": "82300",
+   "bid_iv": null,
+   "bid_size": "4861",
+   "impact_mid_price": null,
+   "mark_iv": "-0.54335138"
+  },
+  "volume": 11121.213000001848,
+  "underlying_asset_symbol": "BTC",
+  "spot_price": "82344.8",
+  "turnover_symbol": "USD",
+  "tags": [
+   "layer_1"
+  ],
+  "oi_value_symbol": "BTC",
+  "turnover_usd": 911480121.0468705,
+  "product_id": 27,
+  "contract_type": "perpetual_futures",
+  "leverage": 200,
+  "contract_value": "0.001000000000000000",
+  "greeks": null,
+  "oi_value_usd": "65939739.5648",
+  "funding_rate": "0.008029263637634183",
+  "oi_reduce_only_mode": false,
+  "turnover": 911480121.0468705,
+  "ltp_change_24h": "0.3671",
+  "top_tag": "crypto",
+  "oi": "800.7760",
+  "symbol": "BTCUSD",
+  "time": "2026-10-18T11:46:17.761950236Z",
+  "price_band": {
+   "lower_limit": "78187.22335484",
+   "upper_limit": "86417.4573922"
+  },
+  "tick_size": "0.500000000000000000",
+  "mark_price": "82303.7667261"
+ },
+ "unsubscribed": {
+  "channels": [
+   {
+    "name": "v2/ticker",
+    "symbols": [
+     "BTCUSD"
+    ]
+   }
+  ],
+  "type": "unsubscribed"
+ }
+}
