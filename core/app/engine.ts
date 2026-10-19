@@ -20,7 +20,7 @@ import type { PortableState, SeriesRecord, Store, WatchRow } from '../store/stor
 import { syncKey, webhookSecret } from './auth.ts';
 import { handleUpdate } from './bot.ts';
 import { Feed, type FeedOpener, type FeedStatus } from './feed.ts';
-import { notes, renderDailyReport, type AlertPayload, type TickerContext } from './messages.ts';
+import { notes, renderDailyReport, type AlertPayload, type StartKind, type TickerContext, type TopListKind } from './messages.ts';
 import { deliver } from './outbox.ts';
 import { applyUniverse, editCoin, qualifies } from './watchlist.ts';
 
@@ -62,6 +62,8 @@ export interface EngineStatus {
   role: Role;
   roleReason: string;
   configProblems: string[];
+  /** Random, non-secret ID of this engine's notebook. */
+  instance: string;
   startedAt: number;
   lastMinuteAt: number | null;
   feed: FeedStatus;
@@ -94,7 +96,10 @@ const DOCKER_SILENCE_MS = 10 * MINUTE_MS;
 const COUNTER_FLUSH_MS = 15 * MINUTE_MS;
 const PRUNE_EVERY_MS = 60 * MINUTE_MS;
 const PAUSE_FOREVER_MS = 30 * 24 * 60 * MINUTE_MS;
-const SETUP_VERSION = '1';
+/** Restarts with less downtime than this (Cloudflare moving the desk worker) get no start message. */
+const START_NOTE_AFTER_DOWN_MS = 2 * MINUTE_MS;
+/** Bump to redo setWebhook, the command list and the menu button on the next start (2: /top added). */
+const SETUP_VERSION = '2';
 
 const seriesKey = (symbol: string, tf: Timeframe): string => `${symbol}|${tf}`;
 const describeDelta = (e: DeltaFailure): string =>
@@ -166,6 +171,17 @@ export class Engine {
   private countersFlushedAt = 0;
   private prunedAt = 0;
   private peerSyncAt = 0;
+  private peerFailingSince: number | null = null;
+  private peerWarned = false;
+
+  /** Random ID of this notebook, so two Cloudflare copies (production and a local test) can tell each other apart. */
+  private instanceId = '';
+  /** When the previous run of this notebook was last alive (engine time), read at start-up. */
+  private previousAliveAt: number | null = null;
+  private startAnnounced = false;
+  private publicCheckAt = 0;
+  private otherEngineAtPublicUrl = false;
+  private tickersAt = 0;
 
   constructor(store: Store, host: EngineHost, env: RuntimeEnv | null, configProblems: string[]) {
     this.store = store;
@@ -189,6 +205,11 @@ export class Engine {
   /** Loads the notebook into memory and starts the feed for the stored watchlist. Call once after construction. */
   init(): void {
     this.store.migrate();
+    this.instanceId = this.store.getMeta('instance_id') ?? crypto.randomUUID();
+    this.store.setMeta('instance_id', this.instanceId);
+    const alive = Number(this.store.getMeta('alive_at') ?? 0);
+    this.previousAliveAt = alive > 0 ? alive : null;
+    this.store.addStats({ instance_starts: 1 });
     for (const rec of this.store.seriesAll()) this.series.set(seriesKey(rec.symbol, rec.timeframe), rec);
     this.reloadWatch();
     this.print(`engine start: ${this.host.runtime} ${this.host.version}, ${this.watch.length} watch rows, ${this.series.size} series${this.configProblems.length ? `; config problems: ${this.configProblems.join('; ')}` : ''}`);
@@ -198,9 +219,31 @@ export class Engine {
     return this.role;
   }
 
-  /** Closes the live feed (Docker shutdown). */
-  stop(): void {
+  /** Public, non-secret ID of this notebook (shown on /health). */
+  id(): string {
+    return this.instanceId;
+  }
+
+  /**
+   * Planned stop (Docker: docker compose down, Ctrl+C). If this engine is sending, it first hands alerts back to
+   * Cloudflare when it can, then says goodbye in the chat. Cloudflare gives no warning before it stops a Durable
+   * Object, so there the next start says how long the bot was away instead.
+   */
+  async shutdown(reason: string): Promise<void> {
     this.feed.close();
+    const env = this.env;
+    if (!env || this.role !== 'active') return;
+    const now = this.now();
+    this.store.setMeta('clean_stop_at', String(now));
+    let detail = `${reason[0]!.toUpperCase()}${reason.slice(1)}.`;
+    if (this.host.runtime === 'Docker' && env.publicBaseUrl) {
+      const r = await this.handBackToCloudflare(`shutdown (${reason})`);
+      detail += r.ok ? ' Alerts were handed back to Cloudflare, which carries on.' : ` Could not hand alerts back to Cloudflare (${r.message}). If Cloudflare is running it takes over by itself within 10 minutes.`;
+    } else {
+      detail += ' Alerts stop until the bot runs again.';
+    }
+    const sent = await this.telegram(new Budget(4)).sendMessage(env.telegramChatId, notes.stopping(this.host.runtime, detail));
+    if (!sent.ok) this.print(`shutdown message failed: ${describeTelegramFailure(sent.error)}`);
   }
 
   /** Engine time: the local clock corrected by Delta's clock (the PC clock was ~10 s slow; Cloudflare's is accurate). */
@@ -275,9 +318,10 @@ export class Engine {
         if (feedDown) await this.priceFallback();
       }
     }
-    this.announce(now);
+    this.announceStart(now);
     await this.confirmedCycle(now, budget);
     this.lastMinuteAt = now;
+    this.store.setMeta('alive_at', String(now));
 
     this.pauseEnded(now);
     this.dailyReportIfDue(now);
@@ -334,6 +378,10 @@ export class Engine {
       this.setRole('standby', 'PUBLIC_BASE_URL is not set', now);
       return;
     }
+    if ((url === ours || url === '') && (await this.otherEngineServesPublicUrl(now, budget))) {
+      this.setRole('standby', 'another copy of the bot is active at PUBLIC_BASE_URL (this one is probably a local test), so it stays silent to avoid double alerts', now);
+      return;
+    }
     if (url === ours) {
       await this.ensureTelegramSetup(tg, ours, now);
       this.setRole('active', 'holds the Telegram webhook', now);
@@ -367,6 +415,31 @@ export class Engine {
     this.setRole('standby', `the Telegram webhook points to ${host}`, now);
   }
 
+  /**
+   * Two Cloudflare copies with the same secrets (production and a local `wrangler dev` test) would both see the
+   * webhook as theirs and both send. Each notebook has a random ID that /health shows, so a copy that finds a
+   * different active engine at PUBLIC_BASE_URL knows it is not the public one. When the check cannot tell (no reply,
+   * an older version, or Cloudflare refusing a Worker's call to itself) it does not block: production never stops
+   * itself.
+   */
+  private async otherEngineServesPublicUrl(now: number, budget: Budget): Promise<boolean> {
+    const base = this.env?.publicBaseUrl?.replace(/\/$/, '');
+    if (!base) return false;
+    const every = this.role === 'active' ? MINUTE_MS - 5_000 : 5 * MINUTE_MS;
+    if (now - this.publicCheckAt < every) return this.otherEngineAtPublicUrl;
+    this.publicCheckAt = now;
+    try {
+      const res = await budget.wrap(this.host.fetch)(`${base}/health`, { headers: { 'user-agent': SYSTEM.exchange.userAgent, 'cache-control': 'no-cache' }, signal: AbortSignal.timeout(5_000) });
+      const body = (await res.json()) as { instance?: unknown; role?: unknown };
+      const other = typeof body.instance === 'string' && body.instance !== this.instanceId && body.role === 'active';
+      if (other !== this.otherEngineAtPublicUrl) this.print(other ? 'another active engine answers at PUBLIC_BASE_URL; staying silent' : 'this engine is the one at PUBLIC_BASE_URL');
+      this.otherEngineAtPublicUrl = other;
+    } catch {
+      this.otherEngineAtPublicUrl = false;
+    }
+    return this.otherEngineAtPublicUrl;
+  }
+
   /** Webhook secret, command list and the Coins menu button; redone when the version of this setup changes. */
   private async ensureTelegramSetup(tg: TelegramClient, ours: string, now: number): Promise<void> {
     const env = this.env!;
@@ -378,8 +451,9 @@ export class Engine {
       await tg.setWebhook(ours, secret),
       await tg.call('setMyCommands', {
         commands: [
-          { command: 'start', description: 'Menu: status, settings, coins, pause' },
+          { command: 'start', description: 'Menu: status, settings, coins, top lists, pause' },
           { command: 'status', description: 'Is the bot healthy right now?' },
+          { command: 'top', description: 'Top gainers, top losers and highest volume (24 h)' },
           { command: 'coins', description: 'Watchlist and timeframes' },
           { command: 'settings', description: 'Margin, volume filter, report time' },
           { command: 'pause', description: 'Pause alerts for a while' },
@@ -412,19 +486,40 @@ export class Engine {
       this.deliverAt = null;
       return;
     }
-    if (wasKnown) this.enqueueNote(`role:${now}`, notes.recovered(`${this.host.runtime} is sending alerts now`, reason), now);
+    if (wasKnown) {
+      // A switch between engines: this note is the start message for the engine taking over.
+      this.startAnnounced = true;
+      this.store.setMeta('announced', `${this.host.runtime}|${this.host.version}`);
+      this.enqueueNote(`role:${now}`, notes.recovered(`${this.host.runtime} is sending alerts now`, reason), now);
+    }
   }
 
-  /** One "I'm running" message per deployed version (and when Docker first takes over). */
-  private announce(now: number): void {
-    if (this.role !== 'active') return;
+  /**
+   * The start message, once per start of this engine, when it is the one sending: first start, back after an
+   * outage (with how long it was away), after a planned stop, or a new version. A restart with no real downtime
+   * (Cloudflare moving the desk worker between machines) is only counted in the daily report.
+   */
+  private announceStart(now: number): void {
+    if (this.role !== 'active' || this.startAnnounced) return;
+    this.startAnnounced = true;
     const key = `${this.host.runtime}|${this.host.version}`;
-    if (this.store.getMeta('announced') === key) return;
-    const active = this.watch.filter(w => w.status === 'active').length;
+    const newVersion = this.store.getMeta('announced') !== key;
+    const lastSeenAt = this.previousAliveAt;
+    const downMs = lastSeenAt === null ? null : Math.max(0, now - lastSeenAt);
+    const planned = this.store.getMeta('clean_stop_at') !== null;
+    const kind: StartKind | null =
+      lastSeenAt === null ? 'first'
+      : downMs !== null && downMs >= START_NOTE_AFTER_DOWN_MS ? (planned ? 'restart' : 'outage')
+      : newVersion ? 'deploy'
+      : null;
     this.store.transaction(() => {
-      this.enqueueNote(`live:${key}`, notes.live(this.host.version, this.host.runtime, active, this.store.settings()), now);
       this.store.setMeta('announced', key);
+      this.store.deleteMeta('clean_stop_at');
+      if (kind) {
+        this.enqueueNote(`start:${now}`, notes.started({ kind, newVersion, runtime: this.host.runtime, version: this.host.version, downMs, lastSeenAt, watch: this.watch, settings: this.store.settings() }), now);
+      }
     });
+    if (!kind) this.print(`restarted after ${Math.round((downMs ?? 0) / 1000)} s; too short for a start message`);
   }
 
   /** Cloudflare: switch to the Docker spare (Telegram command /use_docker). */
@@ -442,14 +537,16 @@ export class Engine {
     return 'Switching to the Docker spare: it takes over within a minute and says so here. Send /use_cloudflare to switch back.';
   }
 
-  /** Docker: give alerts back to Cloudflare (Telegram command /use_cloudflare). Copies settings and watchlist first. */
-  async handBackToCloudflare(actor: string): Promise<string> {
+  /** Docker: give alerts back to Cloudflare (Telegram command /use_cloudflare, or a planned stop). Copies settings and watchlist first. */
+  async handBackToCloudflare(actor: string): Promise<{ ok: boolean; message: string }> {
     const now = this.now();
     const env = this.env;
-    if (this.host.runtime !== 'Docker' || !env) return 'Only the Docker spare can hand back to Cloudflare.';
+    const fail = (message: string): { ok: false; message: string } => ({ ok: false, message });
+    if (this.host.runtime !== 'Docker' || !env) return fail('Only the Docker spare can hand back to Cloudflare.');
+    if (this.role !== 'active') return fail('The Docker spare is not the active engine right now.');
     const base = env.publicBaseUrl?.replace(/\/$/, '');
     const hook = this.webhookUrl();
-    if (!base || !hook) return 'PUBLIC_BASE_URL is not set in the Docker .env, so I do not know where Cloudflare is.';
+    if (!base || !hook) return fail('PUBLIC_BASE_URL is not set in .env.docker, so I do not know where Cloudflare is.');
     const key = await syncKey(env.telegramBotToken);
     try {
       const res = await this.host.fetch(`${base}/api/sync/state`, {
@@ -458,15 +555,15 @@ export class Engine {
         body: JSON.stringify(this.store.exportState()),
         signal: AbortSignal.timeout(10_000)
       });
-      if (!res.ok) return `Cloudflare did not accept the settings copy (HTTP ${res.status}); staying on Docker.`;
+      if (!res.ok) return fail(`Cloudflare did not accept the settings copy (HTTP ${res.status}); staying on Docker.`);
     } catch (err) {
-      return `Cloudflare is not reachable (${errText(err)}); staying on Docker.`;
+      return fail(`Cloudflare is not reachable (${errText(err)}); staying on Docker.`);
     }
     const r = await this.telegram(new Budget(4)).setWebhook(hook, await webhookSecret(env.telegramBotToken, env.telegramWebhookSecret));
-    if (!r.ok) return `Telegram refused the switch: ${describeTelegramFailure(r.error)}`;
+    if (!r.ok) return fail(`Telegram refused the switch: ${describeTelegramFailure(r.error)}`);
     this.store.audit(now, actor, 'handed back to Cloudflare');
     this.setRole('standby', `handed back to Cloudflare by ${actor}`, now);
-    return 'Handed back to Cloudflare: it takes over within a minute and says so here. The Docker spare keeps running on standby.';
+    return { ok: true, message: 'Handed back to Cloudflare: it takes over within a minute and says so here. The Docker spare keeps running on standby.' };
   }
 
   /** Docker: tell Cloudflare we are alive, and on standby copy its settings and watchlist every 5 minutes. */
@@ -476,13 +573,21 @@ export class Engine {
     if (!env || !base) return;
     const key = await syncKey(env.telegramBotToken);
     const fetchFn = budget.wrap(this.host.fetch);
+    let reached = false;
     try {
-      await fetchFn(`${base}/api/sync/heartbeat`, {
+      const hb = await fetchFn(`${base}/api/sync/heartbeat`, {
         method: 'POST',
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
         body: JSON.stringify({ role: this.role }),
         signal: AbortSignal.timeout(8_000)
       });
+      reached = hb.ok;
+    } catch (err) {
+      this.print(`check-in with Cloudflare failed: ${errText(err)}`);
+    }
+    await this.watchCloudflare(reached, now, budget);
+    if (!reached) return;
+    try {
       if (this.role !== 'standby' || now - this.peerSyncAt < 5 * MINUTE_MS) return;
       const res = await fetchFn(`${base}/api/sync/state`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8_000) });
       if (!res.ok) return;
@@ -493,6 +598,34 @@ export class Engine {
     } catch (err) {
       this.print(`sync with Cloudflare failed: ${errText(err)}`);
     }
+  }
+
+  /**
+   * Docker on standby is the only one that can notice Cloudflare stopping (Cloudflare cannot say goodbye). After
+   * 5 minutes without an answer it says so in the chat, once, even on standby (a status note, not an alert, so
+   * nothing is doubled), and again when Cloudflare answers.
+   */
+  private async watchCloudflare(reached: boolean, now: number, budget: Budget): Promise<void> {
+    const env = this.env;
+    if (!env) return;
+    if (reached) {
+      if (this.peerWarned) await this.sendDirect(notes.peerBack(), budget);
+      this.peerFailingSince = null;
+      this.peerWarned = false;
+      return;
+    }
+    this.peerFailingSince ??= now;
+    if (this.peerWarned || this.role !== 'standby' || now - this.peerFailingSince < WARN_AFTER_MS) return;
+    this.peerWarned = true;
+    this.warn('cloudflare', 'Cloudflare engine not answering');
+    await this.sendDirect(notes.peerDown(now - this.peerFailingSince), budget);
+  }
+
+  /** Sends a status note right away, outside the outbox (used where the outbox is on standby). */
+  private async sendDirect(html: string, budget: Budget): Promise<void> {
+    if (!this.env) return;
+    const r = await this.telegram(budget).sendMessage(this.env.telegramChatId, html);
+    if (!r.ok) this.telegramFailure(r.error, this.now());
   }
 
   /** Cloudflare: the Docker spare checked in. */
@@ -528,7 +661,35 @@ export class Engine {
     this.restSucceeded(r.serverNow, false); // the ticker list may come from Delta's cache, with an old Date header
     this.universe = new Map(r.value.tickers.map(t => [t.symbol, t]));
     this.universeAt = now;
+    this.tickersAt = now;
     return true;
+  }
+
+  /**
+   * Top gainers, top losers or highest volume over 24 h (the v1 bot's lists), from a fresh ticker snapshot when the
+   * cached one is over a minute old. Gainers and losers skip coins under the list's minimum volume, because Delta
+   * lists many near-dead coins whose percentages mean little.
+   */
+  async topList(kind: TopListKind): Promise<{ items: DeltaTicker[]; at: number; minVolumeUsd: number }> {
+    const now = this.now();
+    if (now - this.tickersAt > MINUTE_MS && now >= this.restBackoffUntil) {
+      const r = await this.delta(new Budget(4)).tickers();
+      if (r.ok) {
+        this.universe = new Map(r.value.tickers.map(t => [t.symbol, t]));
+        this.tickersAt = now;
+      } else {
+        this.restFailed(r.error, 'tickers', now);
+      }
+    }
+    const minVolumeUsd = SYSTEM.market.topListMinVolumeUsd;
+    const live = [...this.universe.values()].filter(t => t.tradingStatus === 'operational');
+    const items =
+      kind === 'volume' ? live.sort((a, b) => b.turnoverUsd24h - a.turnoverUsd24h)
+      : live
+          // at least 0.01% in the list's direction, so the list never shows "0.00%"
+          .filter(t => t.turnoverUsd24h >= minVolumeUsd && (kind === 'gainers' ? t.change24hPct >= 0.005 : t.change24hPct <= -0.005))
+          .sort((a, b) => (kind === 'gainers' ? b.change24hPct - a.change24hPct : a.change24hPct - b.change24hPct));
+    return { items: items.slice(0, SYSTEM.market.topListSize), at: this.tickersAt, minVolumeUsd };
   }
 
   private applyWatchlist(now: number, graceMs: number): void {
@@ -693,7 +854,7 @@ export class Engine {
     const r = await this.delta(budget).candles(symbol, tf, count, this.now());
     if (!r.ok) {
       this.restFailed(r.error, `${symbol} ${tf} candles`, this.now());
-      this.retryLater(key, this.now() + 10_000);
+      this.retryLater(key);
       return;
     }
     this.restSucceeded(r.serverNow, r.serverClock);
@@ -775,12 +936,13 @@ export class Engine {
     this.retries.set(key, r);
   }
 
-  private retryLater(key: string, at: number): void {
+  /** After a failed candle request: retry in 10 s, 20 s, 40 s... up to 2 min, so a Delta outage is not hammered. */
+  private retryLater(key: string): void {
     const r = this.retries.get(key) ?? { attempts: 0, notBefore: 0, warned: false };
     r.attempts++;
-    r.notBefore = at;
+    r.notBefore = this.now() + Math.min(10_000 * 2 ** (r.attempts - 1), 2 * MINUTE_MS);
     this.retries.set(key, r);
-    this.followUp(at);
+    this.followUp(r.notBefore);
   }
 
   private warnOnce(key: string, detail: string): void {
@@ -930,6 +1092,7 @@ export class Engine {
       role: this.role,
       roleReason: this.roleReason,
       configProblems: this.configProblems,
+      instance: this.instanceId,
       startedAt: this.startedAt,
       lastMinuteAt: this.lastMinuteAt,
       feed: this.feed.status(),
@@ -949,7 +1112,14 @@ export class Engine {
     const s = this.store.settings();
     const local = localClock(now, s.monitoring.timeZone);
     const [h, m] = s.monitoring.dailyReportTime.split(':').map(Number) as [number, number];
-    if (local.minutes < h * 60 + m || this.store.getMeta('daily_report_date') === local.date) return;
+    const last = this.store.getMeta('daily_report_date');
+    if (local.minutes < h * 60 + m || last === local.date) return;
+    const started = localClock(this.startedAt + this.clockOffsetMs, s.monitoring.timeZone);
+    if (last === null && started.date === local.date && started.minutes >= h * 60 + m) {
+      // First start after today's report time: the start message has just gone out, so the first report is tomorrow.
+      this.store.setMeta('daily_report_date', local.date);
+      return;
+    }
     this.flushCounters(now);
     const since = Number(this.store.getMeta('stats_since') ?? this.startedAt);
     this.store.transaction(() => {

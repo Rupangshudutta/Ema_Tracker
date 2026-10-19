@@ -3,7 +3,11 @@
 # Production: Cloudflare dashboard > Workers & Pages > ema-tracker > Settings > Variables and secrets >
 #             Add > Type "Secret" (not "Text": plain variables are wiped by the next deploy from GitHub).
 #             Or from a terminal: npx wrangler secret put TELEGRAM_BOT_TOKEN
-# Local dev:  copy this file to .dev.vars (git-ignored) and fill in the values.
+# Local dev:  copy this file to .dev.vars (git-ignored) and fill in the values. `wrangler dev` reads .dev.vars and
+#             ignores .env (the old v1 file) whenever .dev.vars exists.
+#             With real values the local copy sends real messages. It stays silent by itself while the deployed
+#             Cloudflare engine is active (it checks PUBLIC_BASE_URL/health), so a local test cannot double alerts.
+#             To keep a local copy silent in any case, add RUNTIME_ROLE=standby.
 #
 # Non-secret settings (PUBLIC_BASE_URL, RUNTIME_ROLE, LOG_LEVEL) live in wrangler.jsonc under "vars".
 

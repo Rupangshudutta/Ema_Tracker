@@ -52,6 +52,12 @@ export const SYSTEM = {
   timing: {
     settleSeconds: 3
   },
+  market: {
+    /** Coins per list in Top gainers, Top losers and Highest volume (as in the v1 bot). */
+    topListSize: 10,
+    /** Gainers and losers skip coins with less 24 h volume than this; Delta lists many near-dead coins. */
+    topListMinVolumeUsd: 1_000_000
+  },
   delivery: {
     digestThreshold: 4,
     lateWindowMinutes: 30,

@@ -105,9 +105,21 @@ const sideWord = (d: Direction): string => (d === 'up' ? 'above' : 'below');
 const coin = (p: AlertBase): string => `<b>${escapeHtml(p.symbol)} ${p.timeframe}</b>`;
 const closeAt = (p: AlertBase): number => p.candleStart + TIMEFRAME_MS[p.timeframe];
 
-function contextLine(lead: string, ctx: TickerContext | null): string {
-  if (!ctx) return lead;
-  return `${lead} · 24h ${fmtPct(ctx.change24hPct)} · vol ${fmtUsd(ctx.turnoverUsd24h)}`;
+/**
+ * TradingView chart for a Delta India perpetual: symbol DELTAIN:<symbol>.P. Checked on 2026-10-20: TradingView
+ * resolves DELTAIN-BTCUSD.P and answers 404 for a made-up symbol.
+ */
+export function chartUrl(symbol: string): string {
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`DELTAIN:${symbol}.P`)}`;
+}
+
+const chartLink = (symbol: string): string => `<a href="${escapeHtml(chartUrl(symbol))}">chart</a>`;
+
+function contextLine(lead: string, ctx: TickerContext | null, symbol: string): string {
+  const parts = [lead];
+  if (ctx) parts.push(`24h ${fmtPct(ctx.change24hPct)}`, `vol ${fmtUsd(ctx.turnoverUsd24h)}`);
+  parts.push(chartLink(symbol));
+  return parts.join(' · ');
 }
 
 function lateLine(o: RenderOptions): string[] {
@@ -123,7 +135,7 @@ export function renderAlert(id: string, p: AlertPayload, o: RenderOptions): stri
         '✅ <b>CONFIRMED</b> · candle closed',
         `${dirIcon(p.direction)} ${coin(p)} ${dirWord(p.direction)} cross`,
         `EMA 9 closed ${sideWord(p.direction)} EMA 15: gap ${fmtPct(p.spreadPct, 3)} (margin ${p.marginPct.toFixed(2)}%)`,
-        contextLine(`Close ${fmtPrice(p.close)}`, p.ctx)
+        contextLine(`Close ${fmtPrice(p.close)}`, p.ctx, p.symbol)
       );
       if (p.realtimeAt !== null && p.realtimeCancelled) lines.push('↩️ The realtime alert was cancelled before the close, but the close confirmed the cross.');
       else if (p.realtimeAt !== null) lines.push(`⚡ The realtime alert came ${fmtDuration(closeAt(p) - p.realtimeAt)} before the close.`);
@@ -135,7 +147,7 @@ export function renderAlert(id: string, p: AlertPayload, o: RenderOptions): stri
         '⚡ <b>REALTIME</b> · candle still open',
         `${dirIcon(p.direction)} ${coin(p)} ${dirWord(p.direction)} cross`,
         `On the live price EMA 9 is ${sideWord(p.direction)} EMA 15: gap ${fmtPct(p.spreadPct, 3)} (margin ${p.marginPct.toFixed(2)}%)`,
-        contextLine(`Price ${fmtPrice(p.price)}`, p.ctx),
+        contextLine(`Price ${fmtPrice(p.price)}`, p.ctx, p.symbol),
         `Candle closes ${fmtTime(closeAt(p), o.timeZone)} ${tz}; you get CONFIRMED or NOT CONFIRMED then. · <code>${id}</code>`
       );
       break;
@@ -210,7 +222,7 @@ export function renderStatus(st: EngineStatus, now: number): string {
     st.problems.length ? `Health: ⚠️ ${escapeHtml(st.problems.join('; '))}` : 'Health: ✅ all good',
     feedLine(st, now),
     `Coins: ${st.coins.active} watched · ${st.coins.paused} paused · ${st.coins.removed} removed · ${st.coins.series} coin-timeframes`,
-    `Last candle check: ${st.lastMinuteAt === null ? 'not yet' : `${fmtDuration(now - st.lastMinuteAt)} ago`}`,
+    `Last candle check: ${st.lastMinuteAt === null ? 'not yet' : `${fmtDuration(now - st.lastMinuteAt)} ago`} · running since ${fmtDateTime(st.startedAt, tz)} ${tzLabel(tz)}`,
     st.delta.failingSince === null ? 'Delta API: ok' : `Delta API: <b>failing</b> for ${fmtDuration(now - st.delta.failingSince)} (${escapeHtml(st.delta.lastError ?? '')})`,
     `Messages waiting: ${st.outbox.pending}`,
     paused !== null && paused > now ? `Alerts: ⏸ paused until ${fmtDateTime(paused, tz)} ${tzLabel(tz)}` : 'Alerts: on',
@@ -232,19 +244,60 @@ export function renderDailyReport(st: EngineStatus, stats: Readonly<Record<strin
     `Delivery: ${n(sent)} messages · ${n(stats.late)} late · ${n(stats.missed)} in a missed-summary · ${n(stats.expired)} dropped (too old) · ${n(stats.failed)} failed`,
     upPct === null ? 'Live feed: idle' : `Live feed: up ${upPct.toFixed(1)}% · ${n(stats.feed_drops)} drops · price fallback ${n(stats.fallback_minutes)} min`,
     `Delta API: ${n(restCalls)} calls · ${n(stats.rest_fail)} failed · ${n(stats.rest_429)} rate-limited${stats.series_problems ? ` · ${n(stats.series_problems)} late or missing candles` : ''}`,
+    `Engine starts: ${n(stats.instance_starts)} (Cloudflare moves the bot between machines now and then; nothing is lost)`,
     settingsLine(st.settings)
   ];
   if (st.problems.length) lines.push(`⚠️ Right now: ${escapeHtml(st.problems.join('; '))}`);
   return lines.join('\n');
 }
 
+// ---------------------------------------------------------------- market lists (v1's Top Gainers, Top Losers, Highest Volume)
+
+export type TopListKind = 'gainers' | 'losers' | 'volume';
+
+const TOP_TITLE: Record<TopListKind, string> = { gainers: '📈 <b>Top gainers</b> (24h)', losers: '📉 <b>Top losers</b> (24h)', volume: '💰 <b>Highest volume</b> (24h)' };
+
+export interface TopListItem {
+  symbol: string;
+  lastPrice: number;
+  change24hPct: number;
+  turnoverUsd24h: number;
+}
+
+export function renderTopList(kind: TopListKind, items: readonly TopListItem[], at: number, minVolumeUsd: number, watched: ReadonlySet<string>, timeZone: string): string {
+  const lines = [`${TOP_TITLE[kind]} · Delta India perpetuals · ${at ? `${fmtTime(at, timeZone)} ${tzLabel(timeZone)}` : 'no data yet'}`];
+  if (kind !== 'volume') lines.push(`Coins with at least ${fmtUsd(minVolumeUsd)} volume`);
+  if (!items.length) lines.push('', 'No data from Delta right now; try again in a minute.');
+  items.forEach((t, i) => {
+    lines.push(`${i + 1}. <b>${escapeHtml(t.symbol)}</b> ${fmtPrice(t.lastPrice)} ${t.change24hPct >= 0 ? '🟢' : '🔴'} ${fmtPct(t.change24hPct)} · vol ${fmtUsd(t.turnoverUsd24h)}${watched.has(t.symbol) ? ' 👁' : ''}`);
+  });
+  if (kind !== 'volume' && items.length && items.length < SYSTEM.market.topListSize) {
+    lines.push(`Only ${items.length} coin${items.length === 1 ? ' is' : 's are'} ${kind === 'gainers' ? 'up' : 'down'} over 24 h with enough volume.`);
+  }
+  if (items.some(t => watched.has(t.symbol))) lines.push('👁 = on your watchlist');
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------- notes
+
+export type StartKind = 'first' | 'deploy' | 'outage' | 'restart';
+
+/** Watched coins grouped by timeframe: "15m: BTCUSD, ETHUSD" then "5m: BTCUSD". */
+function watchSummary(watch: readonly { symbol: string; timeframes: readonly Timeframe[]; status: string }[]): string {
+  const active = watch.filter(w => w.status === 'active');
+  if (!active.length) return 'No coins on the watchlist yet: coins above your volume filter join within a minute.';
+  const groups = (['5m', '15m', '1h', '4h'] as const)
+    .map(tf => ({ tf, coins: active.filter(w => w.timeframes.includes(tf)).map(w => escapeHtml(w.symbol)) }))
+    .filter(g => g.coins.length)
+    .map(g => `${g.tf}: ${g.coins.join(', ')}`);
+  return [`Watching ${active.length} coin${active.length === 1 ? '' : 's'}:`, ...groups].join('\n');
+}
 
 const tfList = (tfs: readonly Timeframe[]): string => tfs.join(', ');
 
 export const notes = {
-  joined(symbols: readonly { symbol: string; turnoverUsd24h: number }[], tfs: readonly Timeframe[]): string {
-    const list = symbols.map(s => `${escapeHtml(s.symbol)} (${fmtUsd(s.turnoverUsd24h)})`).join(', ');
+  joined(symbols: readonly { symbol: string; turnoverUsd24h: number; change24hPct?: number }[], tfs: readonly Timeframe[]): string {
+    const list = symbols.map(s => `${escapeHtml(s.symbol)} (${fmtUsd(s.turnoverUsd24h)}${s.change24hPct === undefined ? '' : `, 24h ${fmtPct(s.change24hPct)}`})`).join(', ');
     return `🆕 <b>Joined the watchlist</b> on ${tfList(tfs)}: ${list}.\nOpen <b>Coins</b> in the menu to change timeframes or remove them.`;
   },
   paused(symbols: readonly { symbol: string; turnoverUsd24h: number | null }[], thresholdUsd: number): string {
@@ -257,14 +310,36 @@ export const notes = {
   capReached(count: number, cap: number): string {
     return `ℹ️ ${count} more coin${count === 1 ? '' : 's'} pass your volume filter, but the watchlist is full (${cap} coins). Remove a coin or raise the filter to make room.`;
   },
-  live(version: string, runtime: string, coins: number, s: UserSettings): string {
+  started(p: { kind: StartKind; newVersion: boolean; runtime: string; version: string; downMs: number | null; lastSeenAt: number | null; watch: readonly { symbol: string; timeframes: readonly Timeframe[]; status: string }[]; settings: UserSettings }): string {
+    const s = p.settings;
+    const tz = s.monitoring.timeZone;
+    const also = p.newVersion ? ` Now on version ${escapeHtml(p.version)}.` : '';
+    const why =
+      p.kind === 'first' ? 'First start of EMA Tracker v2.'
+      : p.kind === 'deploy' ? `New version ${escapeHtml(p.version)} is live.`
+      : p.kind === 'restart' ? `Back after a planned stop of ${fmtDuration(p.downMs ?? 0)}.${also}`
+      : `Back online after ${fmtDuration(p.downMs ?? 0)} away (last seen ${fmtDateTime(p.lastSeenAt ?? 0, tz)} ${tzLabel(tz)}). Alerts missed meanwhile follow, marked LATE or in one list.${also}`;
     return [
-      `🟢 <b>EMA Tracker v2 is running</b> on ${escapeHtml(runtime)}`,
-      `Version ${escapeHtml(version)}`,
-      `Watching ${coins} Delta India coin${coins === 1 ? '' : 's'} · margin ${s.signal.marginPct.toFixed(2)}% · volume filter ${fmtUsd(s.coins.volumeThresholdUsd)}`,
-      'Alerts: ⚡ REALTIME while a candle is open, ✅ CONFIRMED at the close.',
-      'Send /start for the menu.'
+      `🟢 <b>EMA Tracker started</b> · ${escapeHtml(p.runtime)}`,
+      why,
+      watchSummary(p.watch),
+      `EMA 9/15 · margin ${s.signal.marginPct.toFixed(2)}% · volume filter ${fmtUsd(s.coins.volumeThresholdUsd)} · new coins on ${s.coins.defaultTimeframes.join(', ')}`,
+      `Alerts: ⚡ REALTIME while a candle is open, ✅ CONFIRMED at the close · daily report ${s.monitoring.dailyReportTime} ${tzLabel(tz)}`,
+      `Version ${escapeHtml(p.version)} · send /start for the menu.`
     ].join('\n');
+  },
+  stopping(runtime: string, detail: string): string {
+    return `🔴 <b>EMA Tracker stopping</b> · ${escapeHtml(runtime)}\n${escapeHtml(detail)}`;
+  },
+  peerDown(silentMs: number): string {
+    return [
+      `🔴 <b>Cloudflare engine not answering</b> for ${fmtDuration(silentMs)}. Alerts may have stopped.`,
+      'The Docker spare on your PC is on standby. To send alerts from the PC instead, run this in the project folder:',
+      "<code>$env:RUNTIME_ROLE='active'; docker compose -f runtimes/docker/compose.yaml up -d</code>"
+    ].join('\n');
+  },
+  peerBack(): string {
+    return '🟢 <b>Cloudflare engine answering again</b>. The Docker spare stays on standby.';
   },
   warning(title: string, detail: string): string {
     return `⚠️ <b>${escapeHtml(title)}</b>\n${escapeHtml(detail)}`;

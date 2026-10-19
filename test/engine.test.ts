@@ -53,8 +53,8 @@ describe('engine on Cloudflare: start-up', () => {
     assert.ok(w.telegram.some(c => c.method === 'setMyCommands'));
     assert.ok(w.telegram.some(c => c.method === 'setChatMenuButton'));
     const texts = w.sent();
-    assert.equal(count(texts, /EMA Tracker v2 is running/), 1);
-    assert.match(texts.find(t => /Joined the watchlist/.test(t))!, /on 15m: BTCUSD \(\$400M\), ETHUSD \(\$200M\)/);
+    assert.equal(count(texts, /EMA Tracker started<\/b> · Cloudflare\nFirst start/), 1);
+    assert.match(texts.find(t => /Joined the watchlist/.test(t))!, /on 15m: BTCUSD \(\$400M, 24h \+1\.50%\), ETHUSD \(\$200M, 24h \+1\.50%\)/);
     assert.equal(count(texts, /LOWUSD/), 0);
     assert.equal(count(texts, REALTIME) + count(texts, CONFIRMED), 0);
     const st = engine.status();

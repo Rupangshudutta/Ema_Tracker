@@ -60,6 +60,7 @@ function health(engine: Engine): Response {
     ok: st.healthy,
     runtime: st.runtime,
     version: st.version,
+    instance: st.instance,
     role: st.role,
     roleReason: st.roleReason,
     problems: st.problems,

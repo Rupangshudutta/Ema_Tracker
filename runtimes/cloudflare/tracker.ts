@@ -110,8 +110,11 @@ export class Tracker extends DurableObject<Env> {
     );
     ctx.blockConcurrencyWhile(async () => {
       this.engine.init();
-      // Pick up within a second after a restart or deploy instead of waiting for the next timer tick.
-      await this.setAlarm(Date.now() + 1000);
+      // Pick up within a second after a restart or deploy instead of waiting for the next timer tick. An alarm that
+      // is already due is left alone: replacing it cancels the alarm run that may be starting this very object.
+      const pending = await ctx.storage.getAlarm();
+      if (pending === null || pending > Date.now() + 1000) await this.setAlarm(Date.now() + 1000);
+      else this.alarmAt = pending;
     });
   }
 

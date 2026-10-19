@@ -12,7 +12,7 @@ export type Universe = ReadonlyMap<string, DeltaTicker>;
 export interface WatchlistChange {
   /** Rows to write (new or changed). */
   rows: WatchRow[];
-  joined: { symbol: string; turnoverUsd24h: number }[];
+  joined: { symbol: string; turnoverUsd24h: number; change24hPct: number }[];
   paused: { symbol: string; turnoverUsd24h: number | null }[];
   resumed: string[];
   /** Coins that pass the filter but did not fit under the cap. */
@@ -73,7 +73,7 @@ export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: 
     }
     active++;
     out.rows.push({ symbol: t.symbol, timeframes: sortTimeframes(s.coins.defaultTimeframes), origin: 'auto', status: 'active', belowSince: null, updatedAt: now });
-    out.joined.push({ symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h });
+    out.joined.push({ symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct });
   }
   return out;
 }

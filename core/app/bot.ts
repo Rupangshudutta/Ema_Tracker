@@ -3,7 +3,7 @@
 import { MARGIN_OPTIONS_PCT, SYSTEM, TIMEFRAMES, VOLUME_OPTIONS_USD, isTimeframe, type Timeframe } from '../config/settings.ts';
 import { escapeHtml, type InlineButton, type InlineKeyboard, type TelegramClient, type TelegramUpdate } from '../notify/telegram.ts';
 import type { Engine } from './engine.ts';
-import { fmtDateTime, fmtUsd, renderStatus, tzLabel } from './messages.ts';
+import { fmtDateTime, fmtUsd, renderStatus, renderTopList, tzLabel, type TopListKind } from './messages.ts';
 
 interface Screen {
   html: string;
@@ -49,6 +49,8 @@ function mainScreen(engine: Engine): Screen {
     keyboard: {
       inline_keyboard: [
         [button('📊 Status', 'st'), button('⚙️ Settings', 'nav:set')],
+        [button('📈 Top gainers', 'top:gainers'), button('📉 Top losers', 'top:losers')],
+        [button('💰 Highest volume', 'top:volume')],
         [app ? { text: '🪙 Coins', web_app: { url: app } } : button('🪙 Coins', 'co')],
         [until ? button('▶️ Resume alerts', 'res') : button('⏸ Pause alerts', 'nav:p'), button('❓ Help', 'hp')]
       ]
@@ -128,6 +130,24 @@ function pauseScreen(): Screen {
   };
 }
 
+const TOP_KINDS: readonly TopListKind[] = ['gainers', 'losers', 'volume'];
+const isTopKind = (v: string): v is TopListKind => (TOP_KINDS as readonly string[]).includes(v);
+
+/** The v1 bot's Top Gainers / Top Losers / Highest Volume lists, with buttons to switch between them. */
+async function topScreen(engine: Engine, kind: TopListKind): Promise<Screen> {
+  const r = await engine.topList(kind);
+  const watched = new Set(engine.watchRows().filter(w => w.status === 'active').map(w => w.symbol));
+  return {
+    html: renderTopList(kind, r.items, r.at, r.minVolumeUsd, watched, engine.settings().monitoring.timeZone),
+    keyboard: {
+      inline_keyboard: [
+        [button('📈 Gainers', 'top:gainers'), button('📉 Losers', 'top:losers'), button('💰 Volume', 'top:volume')],
+        back()
+      ]
+    }
+  };
+}
+
 function statusScreen(engine: Engine): Screen {
   return { html: renderStatus(engine.status(), engine.now()), keyboard: { inline_keyboard: [[button('🔄 Refresh', 'st')], back()] } };
 }
@@ -166,7 +186,7 @@ function helpScreen(engine: Engine): Screen {
       '❌ <b>NOT CONFIRMED</b>: the realtime cross did not hold at the close.',
       '⏰ <b>LATE</b>: held up by an outage. After 30 min alerts come in one summary; after 6 h they are dropped.',
       '',
-      'Commands: /start menu · /status · /coins · /watch BTCUSD 5m 15m · /unwatch BTCUSD · /pause 60 · /resume · /settings',
+      'Commands: /start menu · /status · /top (gainers, losers, volume) · /coins · /watch BTCUSD 5m 15m · /unwatch BTCUSD · /pause 60 · /resume · /settings',
       engine.host.runtime === 'Cloudflare' ? 'Engine switch: /use_docker hands alerts to the Docker spare on your PC.' : 'Engine switch: /use_cloudflare hands alerts back to Cloudflare.'
     ].join('\n'),
     keyboard: { inline_keyboard: [back()] }
@@ -178,10 +198,12 @@ interface CallbackResult {
   toast?: string;
 }
 
-function onCallback(engine: Engine, data: string, actor: string): CallbackResult {
+async function onCallback(engine: Engine, data: string, actor: string): Promise<CallbackResult> {
   const [kind, value = ''] = data.split(/:(.*)/s) as [string, string?];
   const failed = (errors: string[]): CallbackResult => ({ toast: `Not saved: ${errors[0] ?? 'invalid value'}`.slice(0, 190) });
   switch (kind) {
+    case 'top':
+      return isTopKind(value) ? { screen: await topScreen(engine, value) } : { screen: mainScreen(engine) };
     case 'nav':
       return {
         screen:
@@ -261,7 +283,7 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
       await tg.answerCallback(q.id, 'Not allowed');
       return;
     }
-    const r = onCallback(engine, q.data ?? '', `user:${q.from.id}`);
+    const r = await onCallback(engine, q.data ?? '', `user:${q.from.id}`);
     if (r.screen && q.message) await tg.editMessage(chatId, q.message.message_id, r.screen.html, r.screen.keyboard);
     await tg.answerCallback(q.id, r.toast);
     return;
@@ -282,6 +304,13 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
     case '/start':
     case '/menu':
       return show(mainScreen(engine));
+    case '/top':
+    case '/gainers':
+      return show(await topScreen(engine, 'gainers'));
+    case '/losers':
+      return show(await topScreen(engine, 'losers'));
+    case '/volume':
+      return show(await topScreen(engine, 'volume'));
     case '/status':
       return show(statusScreen(engine));
     case '/settings':
@@ -313,7 +342,7 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
     case '/use_docker':
       return send(escapeHtml(await engine.handOverToDocker(actor)));
     case '/use_cloudflare':
-      return send(escapeHtml(await engine.handBackToCloudflare(actor)));
+      return send(escapeHtml((await engine.handBackToCloudflare(actor)).message));
     default:
       return send('Send /start for the menu.');
   }

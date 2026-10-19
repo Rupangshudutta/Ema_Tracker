@@ -148,17 +148,18 @@ const server = createServer((req, res) => {
 });
 server.listen(PORT, HOST, () => log(`EMA Tracker ${VERSION} Docker spare listening on ${HOST}:${PORT} (data in ${DATA_DIR})`));
 
-function shutdown(signal: string): void {
+/** Hands alerts back to Cloudflare when this engine was sending, says goodbye in the chat, then exits. */
+async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   log(`${signal}: shutting down`);
   if (timer) clearTimeout(timer);
-  engine.stop();
+  const reason = signal === 'SIGTERM' ? 'the Docker container is stopping' : 'the Docker spare was stopped from the keyboard';
+  // compose gives 20 s (stop_grace_period); keep 5 s spare for closing the database.
+  await Promise.race([engine.shutdown(reason).catch(err => log(`shutdown: ${err instanceof Error ? err.message : String(err)}`)), sleep(15_000)]);
   server.close();
-  setTimeout(() => {
-    db.close();
-    process.exit(0);
-  }, 500);
+  db.close();
+  process.exit(0);
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

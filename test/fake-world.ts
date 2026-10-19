@@ -36,6 +36,12 @@ export class FakeWorld {
   health: string[] = [];
   feedSent: string[] = [];
   feedOpens = 0;
+  /** What Cloudflare's public /health answers (null: no answer). */
+  publicHealth: { instance: string; role: string } | null = null;
+  /** False simulates the Cloudflare Worker being down (for the Docker spare's checks). */
+  cloudflareUp = true;
+  /** Calls the Docker spare made to Cloudflare's sync API ("POST /api/sync/heartbeat"). */
+  syncCalls: string[] = [];
   private feedCallbacks: FeedCallbacks | null = null;
   private messageId = 1000;
   wakes: number[] = [];
@@ -95,6 +101,19 @@ export class FakeWorld {
         default: return json({ ok: true, result: true });
       }
     }
+    if (url.startsWith(BASE)) {
+      if (!this.cloudflareUp) throw new TypeError('Cloudflare unreachable');
+      const path = new URL(url).pathname;
+      if (path === '/health') {
+        if (!this.publicHealth) throw new TypeError('no answer');
+        return json(this.publicHealth);
+      }
+      if (path.startsWith('/api/sync/')) {
+        this.syncCalls.push(`${init?.method ?? 'GET'} ${path}`);
+        return path === '/api/sync/heartbeat' || init?.method === 'PUT' ? json({ ok: true, role: 'standby' }) : json({ error: 'not in this test' }, 404);
+      }
+      return json({ error: 'not found' }, 404);
+    }
     if (url.startsWith(HEALTH_URL)) {
       this.health.push(url.slice(HEALTH_URL.length) || 'ok');
       return new Response('OK');
@@ -146,10 +165,10 @@ export function envFor(overrides: Partial<RuntimeEnv> = {}): RuntimeEnv {
   return { telegramBotToken: TOKEN, telegramChatId: CHAT, adminUserIds: [CHAT], telegramWebhookSecret: null, healthcheckPingUrl: HEALTH_URL, role: 'active', publicBaseUrl: BASE, ...overrides };
 }
 
-export function makeEngine(world: FakeWorld, runtime: RuntimeName = 'Cloudflare', env: RuntimeEnv | null = envFor(), db = openSqlite(':memory:')): Engine {
+export function makeEngine(world: FakeWorld, runtime: RuntimeName = 'Cloudflare', env: RuntimeEnv | null = envFor(), db = openSqlite(':memory:'), version = 'test'): Engine {
   const engine = new Engine(new Store(db), {
     runtime,
-    version: 'test',
+    version,
     fetch: world.fetch,
     openFeed: world.openFeed,
     requestWake: at => world.wakes.push(at),

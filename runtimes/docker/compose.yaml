@@ -10,6 +10,8 @@ services:
       dockerfile: runtimes/docker/Dockerfile
     image: ema-tracker:2
     restart: unless-stopped
+    # Time to hand alerts back to Cloudflare and send the stop message before Docker kills the process.
+    stop_grace_period: 20s
     env_file:
       - path: ../../.env.docker
         required: true

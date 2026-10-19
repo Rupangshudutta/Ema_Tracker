@@ -83,6 +83,15 @@ When work happens.
 | `timerSchedule` | How often Cloudflare wakes the bot | every minute | Fixed | wrangler.jsonc | Nobody |
 | `settleSeconds` | Wait after a candle closes before reading it | 3 | Fixed | Config file in git | Nobody |
 
+## Market lists
+
+The v1 bot's Top gainers, Top losers and Highest volume lists (`/top` and the menu).
+
+| Name | What it does | Default | Allowed values | Where it is set | Who changes it |
+| --- | --- | --- | --- | --- | --- |
+| `topListSize` | Coins per list | 10 | Fixed | Config file in git | Nobody |
+| `topListMinVolumeUsd` | Gainers and losers skip coins with less 24 h volume (Delta lists many near-dead coins) | $1M | Fixed | Config file in git | Nobody |
+
 ## Delivery
 
 How alerts reach you.

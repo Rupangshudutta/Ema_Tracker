@@ -37,6 +37,22 @@ Address: https://ema-tracker.rupangshudutta.workers.dev (health page: `/health`)
 | Pick coins and timeframes | `/start` → Coins, search, tick 5m / 15m / 1h / 4h. Untick everything to remove a coin |
 | Do it by typing | `/watch BTCUSD 5m 15m`, `/unwatch BTCUSD`, `/coins` |
 | Mute alerts for a while | `/pause 2h` or `/start` → Pause; `/resume` to undo |
+| See the market | `/start` → 📈 Top gainers, 📉 Top losers, 💰 Highest volume (24 h, top 10), or `/top`. Gainers and losers skip coins under $1M volume; 👁 marks coins on your watchlist |
+
+Every alert has a **chart** link to the coin on TradingView (Delta India perpetual, for example `DELTAIN:BTCUSD.P`).
+
+## Start and stop messages
+
+| Message | When |
+| --- | --- |
+| 🟢 **EMA Tracker started**, first start | The very first run, with the coins and settings it starts with |
+| 🟢 **EMA Tracker started**, new version is live | After a deploy |
+| 🟢 **EMA Tracker started**, back online after N min | After an outage of 2 minutes or more, with when it was last seen. Missed alerts follow, marked LATE or in one list |
+| 🟢 **EMA Tracker started**, back after a planned stop | The Docker spare started again after you stopped it |
+| 🔴 **EMA Tracker stopping** | The Docker spare is stopped while it is sending. It first hands alerts back to Cloudflare when Cloudflare answers |
+| 🔴 **Cloudflare engine not answering** | Sent by the Docker spare on standby when Cloudflare has not answered for 5 minutes (only while the spare runs) |
+
+Cloudflare gives no warning before it stops a bot, so Cloudflare itself cannot send a stop message. You learn about a Cloudflare stop from the "back online after N min" message, from the Docker spare's warning, and from Healthchecks' email. Cloudflare also moves the bot between its machines now and then without downtime; those restarts send no message and are counted in the daily report as engine starts.
 
 Alert labels: ⚡ **REALTIME** (candle still open), ↩️ **REALTIME CANCELLED**, ✅ **CONFIRMED** (candle closed), ❌ **NOT CONFIRMED**, ⏰ **LATE** (held up by an outage). After 30 minutes late, alerts come in one "Missed while offline" list; after 6 hours they are dropped and counted in the daily report.
 
@@ -93,6 +109,14 @@ docker compose -f runtimes/docker/compose.yaml down
 ```
 
 `down` keeps the data volume (`ema-tracker_ema-data`). To update after pulling new code, run the `up -d --build` command again.
+
+## Testing on your PC (`npm run cf:dev`)
+
+- `wrangler dev` reads `.dev.vars`, not `.env`. The old `.env` belongs to the v1 bot; v2 ignores its settings.
+- With an empty `.dev.vars` the local copy runs on standby: it computes everything and sends nothing.
+- With real secrets in `.dev.vars` it sends real messages, but only while no other engine is active: before it takes the Telegram connection it reads `PUBLIC_BASE_URL/health`, and if the deployed Cloudflare engine is active it stays silent. Stop it before you deploy anyway, and never commit `.dev.vars`.
+- Telegram cannot reach your PC, so buttons and commands only work on the deployed Cloudflare engine.
+- On Windows the local runtime sometimes prints "The Workers runtime crashed unexpectedly and is being restarted" right after start or after a reload. It restarts by itself; tests show it happens before the bot's code runs, and it does not affect Cloudflare.
 
 ## Free-plan limits (Cloudflare Workers Free)
 
