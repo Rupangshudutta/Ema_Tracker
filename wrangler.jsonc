@@ -1,0 +1,20 @@
+{
+  // Cloudflare Worker for EMA Tracker v2. Deployed by Cloudflare Workers Builds on pushes to main.
+  // Secrets are never set here; add them in the dashboard (Settings > Variables and Secrets) or with `wrangler secret put`.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ema-tracker",
+  "main": "runtimes/cloudflare/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // Wakes the Worker at the start of every minute (UTC). Candle-close work runs inside the Tracker Durable Object.
+  "triggers": { "crons": ["* * * * *"] },
+
+  // One always-on Tracker object ("the desk worker") holds the live Delta feed and its own SQLite notebook.
+  "durable_objects": { "bindings": [{ "name": "TRACKER", "class_name": "Tracker" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Tracker"] }],
+
+  // Type check (and, from S1, tests) run before every deploy; a failure stops the deploy.
+  "build": { "command": "npm run check", "watch_dir": ["core", "runtimes"] }
+}

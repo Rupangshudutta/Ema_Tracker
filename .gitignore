@@ -22,3 +22,8 @@ Thumbs.db
 *.swp
 *.txt
 alert_state
+
+# Cloudflare local dev state and local secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
