@@ -1,7 +1,8 @@
-# S8: retiring the old bot (waiting for your approval)
+# S8: retiring the old bot (done 2026-10-20)
 
-Nothing below has been deleted. This is the list I propose to remove once v2 has run for a few calm days. Before
-removing anything, the last v1 state gets a git tag (`v1-final`), so every file stays recoverable with one command.
+Approved and done on 2026-10-20. The last v1 state is the git tag `v1-final`; restore any file with
+`git checkout v1-final -- <path>`. `src/ml` and `TensorFlow.js` stay until the AI work is decided. After the removal
+`npm audit` reports 0 vulnerabilities (was 18) and the build installs only the three pinned development tools.
 
 ## Remove (old v1 bot, replaced by v2)
 
