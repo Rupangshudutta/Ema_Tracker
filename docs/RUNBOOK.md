@@ -78,7 +78,7 @@ Alert labels: ⚡ **REALTIME** (candle still open), ↩️ **REALTIME CANCELLED*
    docker compose -f runtimes/docker/compose.yaml up -d --build
    ```
 
-4. Check it: `docker compose -f runtimes/docker/compose.yaml logs -f` should show `role: standby (Cloudflare holds the Telegram webhook)`. It copies your settings and watchlist from Cloudflare every 5 minutes and checks in every minute. Health page: http://127.0.0.1:8787/health
+4. Check it: `docker compose -f runtimes/docker/compose.yaml logs -f` should show `role: standby (Cloudflare holds the Telegram webhook)`. It copies your settings and watchlist from Cloudflare every 5 minutes and checks in every minute. Health page: http://127.0.0.1:8788/health
 
 ### Planned switch to Docker (Cloudflare still works)
 

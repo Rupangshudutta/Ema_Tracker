@@ -200,6 +200,7 @@ describe('engine on Cloudflare: watchlist, standby and reports', () => {
     const reports = w.sent().filter(t => /Daily report/.test(t));
     assert.equal(reports.length, 1);
     assert.match(reports[0]!, /I'm alive: Cloudflare is sending alerts/);
+    assert.equal(engine.status().lastDailyReport, '2026-10-20');
     assert.ok(w.health.length >= 10, `pings: ${w.health.length}`);
     assert.ok(w.health.every(h => h === 'ok'));
   });

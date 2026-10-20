@@ -20,7 +20,8 @@ services:
     volumes:
       - ema-data:/data
     ports:
-      - "127.0.0.1:8787:8787"
+      # 8788 on the PC, so it never clashes with npm run cf:dev (8787)
+      - "127.0.0.1:8788:8787"
     read_only: true
     tmpfs:
       - /tmp

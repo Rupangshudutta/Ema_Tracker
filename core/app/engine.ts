@@ -73,6 +73,8 @@ export interface EngineStatus {
   outbox: { pending: number; oldestEventAt: number | null };
   /** Alerts since the last daily report: all found, and those held back (paused, standby or Telegram not set up). */
   alerts: { found: number; heldBack: number };
+  /** Local date (YYYY-MM-DD, report time zone) of the last daily report, or null before the first one. */
+  lastDailyReport: string | null;
   settings: UserSettings;
   clockOffsetMs: number;
   healthy: boolean;
@@ -1103,6 +1105,7 @@ export class Engine {
       telegram: { lastError: this.telegramLastError, lastErrorAt: this.telegramLastErrorAt, blocked: this.telegramBlocked },
       outbox: { pending: pending.count, oldestEventAt: pending.oldestEventAt },
       alerts: this.alertCounts(),
+      lastDailyReport: this.store.getMeta('daily_report_date'),
       settings: this.store.settings(),
       clockOffsetMs: this.clockOffsetMs,
       healthy: this.role === 'active' && problems.length === 0,
