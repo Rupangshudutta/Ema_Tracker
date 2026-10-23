@@ -12,6 +12,8 @@ export type Sleep = (ms: number) => Promise<void>;
 
 export interface DeltaTicker {
   symbol: string;
+  /** The coin behind the contract, for example BTC for BTCUSD (used in Delta trade-page links). */
+  underlying: string;
   lastPrice: number;
   markPrice: number;
   turnoverUsd24h: number;
@@ -67,6 +69,7 @@ export function parseTicker(raw: unknown): DeltaTicker | null {
   if (!symbol || !(lastPrice > 0) || !Number.isFinite(turnover) || turnover < 0) return null;
   return {
     symbol,
+    underlying: typeof t.underlying_asset_symbol === 'string' && t.underlying_asset_symbol ? t.underlying_asset_symbol : symbol.replace(/USD$/, ''),
     lastPrice,
     markPrice: markPrice > 0 ? markPrice : lastPrice,
     turnoverUsd24h: turnover,

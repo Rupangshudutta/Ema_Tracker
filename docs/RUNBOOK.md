@@ -39,7 +39,7 @@ Address: https://ema-tracker.rupangshudutta.workers.dev (health page: `/health`)
 | Mute alerts for a while | `/pause 2h` or `/start` → Pause; `/resume` to undo |
 | See the market | `/start` → 📈 Top gainers, 📉 Top losers, 💰 Highest volume (24 h, top 10), or `/top`. Gainers and losers skip coins under $1M volume; 👁 marks coins on your watchlist |
 
-Every alert has a **chart** link to the coin on TradingView (Delta India perpetual, for example `DELTAIN:BTCUSD.P`).
+Every alert has a **chart** link that opens TradingView on the alert's own timeframe (Delta India perpetual, for example `DELTAIN:BTCUSD.P` on 5m for a 5m alert) and a **Delta** link to the coin's page on Delta Exchange India. In the coin picker every coin has **📈 TradingView 15m** and **Delta** buttons; they open outside Telegram, so on a phone the browser or the TradingView / Delta app opens on that coin. Delta's own chart opens on the timeframe you last picked in Delta (a link cannot choose it), so pick 15m there once.
 
 ## Start and stop messages
 

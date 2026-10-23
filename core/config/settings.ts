@@ -54,6 +54,14 @@ export const SYSTEM = {
   timing: {
     settleSeconds: 3
   },
+  links: {
+    /** TradingView chart; Delta India perpetuals are DELTAIN:<symbol>.P (checked: resolves; a made-up symbol is 404). */
+    tradingViewChart: 'https://www.tradingview.com/chart/',
+    /** Delta Exchange India trade page: <base>/<underlying>/<symbol> (india.delta.exchange redirects here). */
+    deltaTrade: 'https://www.delta.exchange/app/futures/trade',
+    /** Timeframe charts open on when no alert timeframe applies (the coin picker). */
+    defaultChartTimeframe: '15m' as Timeframe
+  },
   market: {
     /** Coins per list in Top gainers, Top losers and Highest volume (as in the v1 bot). */
     topListSize: 10,

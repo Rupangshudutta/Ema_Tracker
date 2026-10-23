@@ -83,7 +83,7 @@ describe('live feed connection handling', () => {
 describe('watchlist rules', () => {
   const NOW = 10_000_000;
   const s: UserSettings = DEFAULT_USER_SETTINGS;
-  const t = (symbol: string, turnoverUsd24h: number, tradingStatus = 'operational'): DeltaTicker => ({ symbol, lastPrice: 1, markPrice: 1, turnoverUsd24h, change24hPct: 0, openInterestUsd: null, tradingStatus, timestampMs: NOW });
+  const t = (symbol: string, turnoverUsd24h: number, tradingStatus = 'operational'): DeltaTicker => ({ symbol, underlying: symbol.replace(/USD$/, ''), lastPrice: 1, markPrice: 1, turnoverUsd24h, change24hPct: 0, openInterestUsd: null, tradingStatus, timestampMs: NOW });
   const universe = (...list: DeltaTicker[]) => new Map(list.map(x => [x.symbol, x]));
   const row = (symbol: string, over: Partial<WatchRow> = {}): WatchRow => ({ symbol, timeframes: ['15m'], origin: 'auto', status: 'active', belowSince: null, updatedAt: 0, ...over });
 

@@ -21,6 +21,7 @@ import { syncKey, webhookSecret } from './auth.ts';
 import { handleUpdate } from './bot.ts';
 import { Feed, type FeedOpener, type FeedStatus } from './feed.ts';
 import { notes, renderDailyReport, type AlertPayload, type StartKind, type TickerContext, type TopListKind } from './messages.ts';
+import { deltaUrl, tradingViewUrl } from './links.ts';
 import { deliver } from './outbox.ts';
 import { applyUniverse, editCoin, qualifies } from './watchlist.ts';
 
@@ -54,6 +55,9 @@ export interface CoinInfo {
   status: WatchRow['status'] | 'available';
   timeframes: Timeframe[];
   qualifies: boolean;
+  /** TradingView chart on 15m, and the coin's Delta Exchange India page. */
+  chartUrl: string;
+  deltaUrl: string;
 }
 
 export interface EngineStatus {
@@ -742,7 +746,7 @@ export class Engine {
     const out = new Map<string, CoinInfo>();
     for (const t of this.universe.values()) {
       if (!qualifies(t, s)) continue;
-      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true });
+      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true, chartUrl: tradingViewUrl(t.symbol), deltaUrl: deltaUrl(t.symbol, t.underlying) });
     }
     for (const w of this.watch) {
       const t = this.universe.get(w.symbol);
@@ -755,7 +759,9 @@ export class Engine {
         lastPrice: t?.lastPrice ?? null,
         status: w.status,
         timeframes: w.status === 'removed' ? [] : w.timeframes,
-        qualifies: ok
+        qualifies: ok,
+        chartUrl: tradingViewUrl(w.symbol),
+        deltaUrl: deltaUrl(w.symbol, t?.underlying)
       });
     }
     return [...out.values()].sort((a, b) => (b.turnoverUsd24h ?? 0) - (a.turnoverUsd24h ?? 0));

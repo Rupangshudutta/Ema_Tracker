@@ -4,6 +4,7 @@ import { SYSTEM, TIMEFRAMES, TIMEFRAME_MS, type Timeframe, type UserSettings } f
 import type { Direction } from '../domain/signal.ts';
 import { escapeHtml } from '../notify/telegram.ts';
 import type { EngineStatus } from './engine.ts';
+import { deltaUrl, tradingViewUrl } from './links.ts';
 
 /** Ticker numbers shown with an alert; taken from the cached ticker so they never delay or block the alert (I5, I9). */
 export interface TickerContext {
@@ -105,20 +106,15 @@ const sideWord = (d: Direction): string => (d === 'up' ? 'above' : 'below');
 const coin = (p: AlertBase): string => `<b>${escapeHtml(p.symbol)} ${p.timeframe}</b>`;
 const closeAt = (p: AlertBase): number => p.candleStart + TIMEFRAME_MS[p.timeframe];
 
-/**
- * TradingView chart for a Delta India perpetual: symbol DELTAIN:<symbol>.P. Checked on 2026-10-20: TradingView
- * resolves DELTAIN-BTCUSD.P and answers 404 for a made-up symbol.
- */
-export function chartUrl(symbol: string): string {
-  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(`DELTAIN:${symbol}.P`)}`;
+/** "chart" opens TradingView on the alert's own timeframe; "Delta" opens the coin on Delta Exchange India. */
+function chartLinks(p: AlertBase): string {
+  return `<a href="${escapeHtml(tradingViewUrl(p.symbol, p.timeframe))}">chart ${p.timeframe}</a> · <a href="${escapeHtml(deltaUrl(p.symbol))}">Delta</a>`;
 }
 
-const chartLink = (symbol: string): string => `<a href="${escapeHtml(chartUrl(symbol))}">chart</a>`;
-
-function contextLine(lead: string, ctx: TickerContext | null, symbol: string): string {
+function contextLine(lead: string, ctx: TickerContext | null, p: AlertBase): string {
   const parts = [lead];
   if (ctx) parts.push(`24h ${fmtPct(ctx.change24hPct)}`, `vol ${fmtUsd(ctx.turnoverUsd24h)}`);
-  parts.push(chartLink(symbol));
+  parts.push(chartLinks(p));
   return parts.join(' · ');
 }
 
@@ -135,7 +131,7 @@ export function renderAlert(id: string, p: AlertPayload, o: RenderOptions): stri
         '✅ <b>CONFIRMED</b> · candle closed',
         `${dirIcon(p.direction)} ${coin(p)} ${dirWord(p.direction)} cross`,
         `EMA 9 closed ${sideWord(p.direction)} EMA 15: gap ${fmtPct(p.spreadPct, 3)} (margin ${p.marginPct.toFixed(2)}%)`,
-        contextLine(`Close ${fmtPrice(p.close)}`, p.ctx, p.symbol)
+        contextLine(`Close ${fmtPrice(p.close)}`, p.ctx, p)
       );
       if (p.realtimeAt !== null && p.realtimeCancelled) lines.push('↩️ The realtime alert was cancelled before the close, but the close confirmed the cross.');
       else if (p.realtimeAt !== null) lines.push(`⚡ The realtime alert came ${fmtDuration(closeAt(p) - p.realtimeAt)} before the close.`);
@@ -147,7 +143,7 @@ export function renderAlert(id: string, p: AlertPayload, o: RenderOptions): stri
         '⚡ <b>REALTIME</b> · candle still open',
         `${dirIcon(p.direction)} ${coin(p)} ${dirWord(p.direction)} cross`,
         `On the live price EMA 9 is ${sideWord(p.direction)} EMA 15: gap ${fmtPct(p.spreadPct, 3)} (margin ${p.marginPct.toFixed(2)}%)`,
-        contextLine(`Price ${fmtPrice(p.price)}`, p.ctx, p.symbol),
+        contextLine(`Price ${fmtPrice(p.price)}`, p.ctx, p),
         `Candle closes ${fmtTime(closeAt(p), o.timeZone)} ${tz}; you get CONFIRMED or NOT CONFIRMED then. · <code>${id}</code>`
       );
       break;

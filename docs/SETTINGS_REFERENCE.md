@@ -83,6 +83,14 @@ When work happens.
 | `timerSchedule` | How often Cloudflare wakes the bot | every minute | Fixed | wrangler.jsonc | Nobody |
 | `settleSeconds` | Wait after a candle closes before reading it | 3 | Fixed | Config file in git | Nobody |
 
+## Chart links
+
+| Name | What it does | Default | Allowed values | Where it is set | Who changes it |
+| --- | --- | --- | --- | --- | --- |
+| `tradingViewChart` | TradingView chart address; Delta India perpetuals are `DELTAIN:<symbol>.P` | https://www.tradingview.com/chart/ | Fixed | Config file in git | Nobody |
+| `deltaTrade` | Delta Exchange India trade page, as `<address>/<coin>/<symbol>` | https://www.delta.exchange/app/futures/trade | Fixed | Config file in git | Nobody |
+| `defaultChartTimeframe` | Timeframe the coin picker's TradingView button opens on (alerts use their own timeframe) | 15m | Any timeframe | Config file in git | Nobody |
+
 ## Market lists
 
 The v1 bot's Top gainers, Top losers and Highest volume lists (`/top` and the menu).

@@ -56,7 +56,9 @@ export const MINI_APP_HTML = `<!doctype html>
   .tf { min-width: 0; min-height: 40px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
   .tf.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   .tf:disabled { opacity: .5; }
-  .actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+  .actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+  .links { display: flex; gap: 6px; flex-wrap: wrap; }
+  .link { min-height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--accent); font-size: 13px; font-weight: 600; }
   .remove { min-height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--danger); font-size: 13px; }
   .note { font-size: 12px; color: var(--hint); margin-top: 6px; }
   .empty { text-align: center; color: var(--hint); padding: 40px 16px; }
@@ -174,22 +176,40 @@ export const MINI_APP_JS = String.raw`(function () {
         });
         row.appendChild(b);
       });
+      card.appendChild(row);
+      // Chart links on the left (every coin), Remove on the right (watched coins only).
+      var actions = el('div', 'actions');
+      var links = el('div', 'links');
+      links.appendChild(linkButton('📈 TradingView 15m', c.chartUrl));
+      links.appendChild(linkButton('Delta', c.deltaUrl));
+      actions.appendChild(links);
       if (c.status === 'active' || c.status === 'paused') {
         var rm = el('button', 'remove', 'Remove');
         rm.type = 'button';
         rm.disabled = !!state.busy[c.symbol];
         rm.addEventListener('click', function () { save(c, []); });
-        var actions = el('div', 'actions');
         actions.appendChild(rm);
-        card.appendChild(row);
-        card.appendChild(actions);
-      } else {
-        card.appendChild(row);
       }
+      card.appendChild(actions);
       if (c.status === 'paused') card.appendChild(el('div', 'note', 'Below the volume filter: alerts resume on these timeframes when volume recovers.'));
       if (c.status === 'removed') card.appendChild(el('div', 'note', 'You removed this coin. Tick a timeframe to add it back.'));
       list.appendChild(card);
     });
+  }
+  /**
+   * Opens a chart outside Telegram (browser, or the TradingView / Delta app when the phone hands the link to it).
+   * Only https links from our own server are opened.
+   */
+  function openChart(url) {
+    if (typeof url !== 'string' || url.indexOf('https://') !== 0) return;
+    if (tg && tg.openLink) tg.openLink(url);
+    else window.open(url, '_blank', 'noopener');
+  }
+  function linkButton(label, url) {
+    var b = el('button', 'link', label);
+    b.type = 'button';
+    b.addEventListener('click', function () { openChart(url); });
+    return b;
   }
   function save(coin, timeframes) {
     state.busy[coin.symbol] = true;
