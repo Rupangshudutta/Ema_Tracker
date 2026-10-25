@@ -88,7 +88,7 @@ export interface EngineStatus {
 const MINUTE_MS = 60_000;
 const SETTLE_MS = SYSTEM.timing.settleSeconds * 1000;
 const UNIVERSE_EVERY_MS = SYSTEM.coins.universeRefreshMinutes * MINUTE_MS;
-const DROP_GRACE_MS = SYSTEM.coins.dropGraceMinutes * MINUTE_MS;
+const NOT_TRADING_GRACE_MS = SYSTEM.coins.notTradingGraceMinutes * MINUTE_MS;
 const MAX_ALERT_AGE_MS = SYSTEM.delivery.maxAlertAgeHours * 60 * MINUTE_MS;
 const PAIR: EmaPair = { fast: SYSTEM.signal.emaFast, slow: SYSTEM.signal.emaSlow };
 /** Candle requests run this many at a time; each may cost 2 calls on Cloudflare (one retry). */
@@ -212,7 +212,7 @@ export class Engine {
 
   /** Loads the notebook into memory and starts the feed for the stored watchlist. Call once after construction. */
   init(): void {
-    this.store.migrate();
+    this.store.migrate(this.now());
     this.instanceId = this.store.getMeta('instance_id') ?? crypto.randomUUID();
     this.store.setMeta('instance_id', this.instanceId);
     const alive = Number(this.store.getMeta('alive_at') ?? 0);
@@ -322,7 +322,7 @@ export class Engine {
     const feedDown = feed.wanted > 0 && !feed.connected && feed.downSince !== null && now - feed.downSince > FEED_FALLBACK_AFTER_MS;
     if (!this.universe.size || now - this.universeAt >= UNIVERSE_EVERY_MS || feedDown) {
       if (await this.refreshUniverse(now, budget)) {
-        this.applyWatchlist(now, DROP_GRACE_MS);
+        this.applyWatchlist(now, NOT_TRADING_GRACE_MS);
         if (feedDown) await this.priceFallback();
       }
     }
@@ -708,7 +708,7 @@ export class Engine {
     this.store.transaction(() => {
       for (const row of ch.rows) this.store.saveWatch(row);
       if (ch.joined.length) this.enqueueNote(`joined:${now}`, notes.joined(ch.joined, s.coins.defaultTimeframes), now);
-      if (ch.paused.length) this.enqueueNote(`paused:${now}`, notes.paused(ch.paused, s.coins.volumeThresholdUsd), now);
+      if (ch.paused.length) this.enqueueNote(`paused:${now}`, notes.paused(ch.paused), now);
       if (ch.resumed.length) this.enqueueNote(`resumed:${now}`, notes.resumed(ch.resumed), now);
       if (ch.overCap > capNoted) this.enqueueNote(`cap:${now}`, notes.capReached(ch.overCap, SYSTEM.coins.maxWatchlistCoins), now);
       if (ch.overCap !== capNoted) this.store.setMeta('cap_noted', String(ch.overCap));
@@ -794,7 +794,8 @@ export class Engine {
       this.series.clear();
       this.followUp(now);
     }
-    if (before.coins.volumeThresholdUsd !== after.coins.volumeThresholdUsd) this.applyWatchlist(now, 0);
+    // A new filter only changes which new coins join; coins already watched stay.
+    if (before.coins.volumeThresholdUsd !== after.coins.volumeThresholdUsd) this.applyWatchlist(now, NOT_TRADING_GRACE_MS);
     if (after.delivery.pausedUntil !== null && after.delivery.pausedUntil > now) this.store.setMeta('pause_noted', '1');
   }
 

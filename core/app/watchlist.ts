@@ -1,8 +1,11 @@
 // Watchlist rules (pure functions; the engine stores the result).
 //   - Coins above the volume filter join automatically on the default timeframes (15m unless changed), up to the cap.
+//   - Once on the watchlist a coin stays until the user removes it: a volume drop never pauses or removes it
+//     (owner's rule, 2026-10-25). The filter only decides which new coins join and what the coin picker offers.
 //   - A coin the user removed (all timeframes unticked) stays out, even while it is above the filter.
-//   - A coin that falls below the filter for the grace period is paused, and resumes on the same timeframes.
-//   - Changing the filter applies at once (grace 0); a coin is never paused because our own ticker fetch failed.
+//   - Only a coin Delta stops trading (delisted or halted) for the grace period is paused, because there are no
+//     prices to watch; it resumes on the same timeframes when trading restarts. Our own failed ticker fetch never
+//     pauses anything (the rules only run on a fresh ticker list).
 import { SYSTEM, TIMEFRAME_MS, type Timeframe, type UserSettings } from '../config/settings.ts';
 import type { DeltaTicker } from '../exchange/delta.ts';
 import type { WatchRow } from '../store/store.ts';
@@ -19,8 +22,14 @@ export interface WatchlistChange {
   overCap: number;
 }
 
+/** Delta lists the contract and trades it right now. */
+export function isTrading(t: DeltaTicker | undefined): boolean {
+  return t !== undefined && t.tradingStatus === 'operational';
+}
+
+/** Above the volume filter: may join automatically, and the coin picker offers it. */
 export function qualifies(t: DeltaTicker | undefined, s: UserSettings): boolean {
-  return t !== undefined && t.tradingStatus === 'operational' && t.turnoverUsd24h > s.coins.volumeThresholdUsd;
+  return t !== undefined && isTrading(t) && t.turnoverUsd24h > s.coins.volumeThresholdUsd;
 }
 
 export const sortTimeframes = (tfs: readonly Timeframe[]): Timeframe[] => [...new Set(tfs)].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
@@ -34,19 +43,20 @@ export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: 
   for (const row of rows) {
     if (row.status === 'removed') continue;
     const t = universe.get(row.symbol);
-    const ok = qualifies(t, s);
+    const trading = isTrading(t);
     if (row.status === 'paused') {
-      if (ok) resumable.push(row);
+      if (trading) resumable.push(row); // also brings back coins an older version paused for low volume
       continue;
     }
-    if (ok) {
+    if (trading) {
       active++;
       if (row.belowSince !== null) out.rows.push({ ...row, belowSince: null, updatedAt: now });
       continue;
     }
-    const below = row.belowSince ?? now;
-    if (now - below >= graceMs) {
-      out.rows.push({ ...row, status: 'paused', belowSince: below, updatedAt: now });
+    // belowSince now means "not trading since".
+    const since = row.belowSince ?? now;
+    if (now - since >= graceMs) {
+      out.rows.push({ ...row, status: 'paused', belowSince: since, updatedAt: now });
       out.paused.push({ symbol: row.symbol, turnoverUsd24h: t?.turnoverUsd24h ?? null });
     } else {
       active++;
@@ -96,7 +106,7 @@ export function editCoin(rows: readonly WatchRow[], universe: Universe, s: UserS
     return { ok: true, row: { ...existing, timeframes: [], origin: 'user', status: 'removed', belowSince: null, updatedAt: now }, droppedTimeframes, message: `${symbol} removed: no more alerts, live feed closed` };
   }
   if (existing && existing.status !== 'removed') {
-    return { ok: true, row: { ...existing, timeframes: tfs, origin: 'user', updatedAt: now }, droppedTimeframes, message: `${symbol}: ${tfs.join(', ')}${existing.status === 'paused' ? ' (paused while below the volume filter)' : ''}` };
+    return { ok: true, row: { ...existing, timeframes: tfs, origin: 'user', updatedAt: now }, droppedTimeframes, message: `${symbol}: ${tfs.join(', ')}${existing.status === 'paused' ? ' (paused while Delta is not trading it)' : ''}` };
   }
   if (!qualifies(universe.get(symbol), s)) return { ok: false, reason: `${symbol} is not above your volume filter right now` };
   const active = rows.filter(r => r.status === 'active').length;

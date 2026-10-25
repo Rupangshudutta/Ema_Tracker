@@ -64,7 +64,7 @@ function settingsScreen(engine: Engine): Screen {
     html: [
       '⚙️ <b>Settings</b>',
       `<b>Margin</b> ${s.signal.marginPct.toFixed(2)}%: how far EMA 9 must pass EMA 15 before an alert (all coins, timeframes and alert types).`,
-      `<b>Volume filter</b> ${fmtUsd(s.coins.volumeThresholdUsd)}: coins above this 24 h volume join the watchlist; coins below it pause.`,
+      `<b>Volume filter</b> ${fmtUsd(s.coins.volumeThresholdUsd)}: coins above this 24 h volume join the watchlist by themselves. Coins already on your watchlist stay until you remove them.`,
       `<b>New coins start on</b> ${s.coins.defaultTimeframes.join(', ')}.`,
       `<b>Cancel notes</b> ${s.realtime.cancelNotes ? 'on' : 'off'}: a short note when a realtime cross reverses before the close.`,
       `<b>Daily report</b> at ${s.monitoring.dailyReportTime} ${tzLabel(s.monitoring.timeZone)}.`
@@ -99,7 +99,7 @@ function marginScreen(engine: Engine): Screen {
 function volumeScreen(engine: Engine): Screen {
   const current = engine.settings().coins.volumeThresholdUsd;
   return pickerScreen(
-    `💧 <b>Volume filter</b>\nCoins above this 24 h volume join the watchlist (up to ${SYSTEM.coins.maxWatchlistCoins}); coins below it pause and keep your timeframes.`,
+    `💧 <b>Volume filter</b>\nCoins above this 24 h volume join the watchlist by themselves (up to ${SYSTEM.coins.maxWatchlistCoins}) on your new-coin timeframes. A coin whose volume drops later stays until you remove it.`,
     VOLUME_OPTIONS_USD.map(v => ({ label: fmtUsd(v), data: `v:${v}`, current: v === current })),
     4
   );
@@ -166,7 +166,7 @@ function coinsScreen(engine: Engine): Screen {
   const lines = [
     `🪙 <b>Watchlist</b> (${active.length}/${SYSTEM.coins.maxWatchlistCoins})`,
     ...active.map(w => `${escapeHtml(w.symbol)} · ${w.timeframes.join(', ')}${vol(w.symbol)}`),
-    ...paused.map(w => `${escapeHtml(w.symbol)} · ⏸ paused (below the volume filter) · ${w.timeframes.join(', ')}`)
+    ...paused.map(w => `${escapeHtml(w.symbol)} · ⏸ paused (Delta is not trading it) · ${w.timeframes.join(', ')}`)
   ];
   if (!active.length && !paused.length) lines.push('No coins yet: they join within 15 minutes of the bot starting.');
   if (removed.length) lines.push(`Removed by you: ${removed.map(w => escapeHtml(w.symbol)).join(', ')}`);

@@ -191,7 +191,7 @@ export const MINI_APP_JS = String.raw`(function () {
         actions.appendChild(rm);
       }
       card.appendChild(actions);
-      if (c.status === 'paused') card.appendChild(el('div', 'note', 'Below the volume filter: alerts resume on these timeframes when volume recovers.'));
+      if (c.status === 'paused') card.appendChild(el('div', 'note', 'Delta is not trading this coin right now: alerts resume on these timeframes when trading restarts.'));
       if (c.status === 'removed') card.appendChild(el('div', 'note', 'You removed this coin. Tick a timeframe to add it back.'));
       list.appendChild(card);
     });

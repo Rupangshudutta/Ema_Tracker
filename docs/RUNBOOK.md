@@ -62,7 +62,7 @@ Alert labels: ⚡ **REALTIME** (candle still open), ↩️ **REALTIME CANCELLED*
 | --- | --- | --- |
 | ⚠️ Live price feed down | Delta's live prices stopped for 5+ min. Realtime alerts fall back to a once-a-minute price check; confirmed alerts are unaffected | None; it reconnects by itself (waiting longer between tries if Delta refuses) |
 | ⚠️ Delta API not answering | Candle checks fail for 5+ min | None; confirmed alerts catch up marked LATE |
-| ⏸ Paused: COIN fell below your volume filter | 24 h volume under the filter for an hour | None; it resumes on the same timeframes |
+| ⏸ Paused: Delta is not trading COIN | Delta delisted or halted the coin for an hour (volume never pauses a coin; only you remove coins) | None; it resumes on the same timeframes when trading restarts |
 | Healthchecks email "down" | The active engine stopped pinging, or reports a problem | Open `/health` and read `problems`; if Cloudflare is down, start the Docker spare (below) |
 | Nothing at all, no daily report | Secrets missing, or no engine holds the Telegram connection | Open `/health`; `roleReason` says why |
 

@@ -296,12 +296,12 @@ export const notes = {
     const list = symbols.map(s => `${escapeHtml(s.symbol)} (${fmtUsd(s.turnoverUsd24h)}${s.change24hPct === undefined ? '' : `, 24h ${fmtPct(s.change24hPct)}`})`).join(', ');
     return `🆕 <b>Joined the watchlist</b> on ${tfList(tfs)}: ${list}.\nOpen <b>Coins</b> in the menu to change timeframes or remove them.`;
   },
-  paused(symbols: readonly { symbol: string; turnoverUsd24h: number | null }[], thresholdUsd: number): string {
-    const list = symbols.map(s => `${escapeHtml(s.symbol)}${s.turnoverUsd24h === null ? ' (no longer listed)' : ` (${fmtUsd(s.turnoverUsd24h)})`}`).join(', ');
-    return `⏸ <b>Paused</b>: ${list} fell below your ${fmtUsd(thresholdUsd)} volume filter. They resume on the same timeframes if volume recovers.`;
+  paused(symbols: readonly { symbol: string; turnoverUsd24h: number | null }[]): string {
+    const list = symbols.map(s => `${escapeHtml(s.symbol)}${s.turnoverUsd24h === null ? ' (no longer listed)' : ''}`).join(', ');
+    return `⏸ <b>Paused</b>: Delta is not trading ${list} right now (delisted or halted), so there are no prices to watch. ${symbols.length === 1 ? 'It stays' : 'They stay'} on your watchlist and resume on the same timeframes when trading restarts.`;
   },
   resumed(symbols: readonly string[]): string {
-    return `▶️ <b>Resumed</b>: ${symbols.map(escapeHtml).join(', ')} ${symbols.length === 1 ? 'is' : 'are'} back above your volume filter.`;
+    return `▶️ <b>Resumed</b>: ${symbols.map(escapeHtml).join(', ')} ${symbols.length === 1 ? 'is' : 'are'} trading on Delta again.`;
   },
   capReached(count: number, cap: number): string {
     return `ℹ️ ${count} more coin${count === 1 ? '' : 's'} pass your volume filter, but the watchlist is full (${cap} coins). Remove a coin or raise the filter to make room.`;

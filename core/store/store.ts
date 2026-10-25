@@ -6,7 +6,10 @@ import { DEFAULT_USER_SETTINGS, isTimeframe, validateUserSettings, type Timefram
 import type { Direction, RealtimeCandle, Side, SignalState } from '../domain/signal.ts';
 import type { SqlDriver } from './sql.ts';
 
-const MIGRATIONS: readonly (readonly string[])[] = [
+/** A schema change (SQL statements) or a one-time data change (run inside the same transaction). */
+type Migration = readonly string[] | ((store: Store, now: number) => void);
+
+const MIGRATIONS: readonly Migration[] = [
   [
     // 1: v2 engine. Drops the S0 probe tables, which the engine replaces.
     'DROP TABLE IF EXISTS probe_minute',
@@ -36,7 +39,16 @@ const MIGRATIONS: readonly (readonly string[])[] = [
     'CREATE INDEX log_at ON log (at)',
     'CREATE TABLE stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL)',
     'CREATE TABLE telegram_update (update_id INTEGER PRIMARY KEY, at INTEGER NOT NULL)'
-  ]
+  ],
+  // 2 (2026-10-25): coins that join because of their volume start on 15m again, as the owner asked (the stored
+  // choice was 1h). Only this setting changes; coins already on the watchlist keep their timeframes. It stays
+  // changeable in Settings > New coins.
+  (store, now) => {
+    const s = store.settings();
+    const tfs = s.coins.defaultTimeframes;
+    if (tfs.length === 1 && tfs[0] === '15m') return;
+    store.saveSettings({ ...s, coins: { ...s.coins, defaultTimeframes: ['15m'] } }, 'update 2', `new-coin timeframes ${tfs.join(',')} -> 15m (owner request 2026-10-25)`, now);
+  }
 ];
 
 const DAY_MS = 24 * 60 * 60_000;
@@ -152,12 +164,14 @@ export class Store {
   }
 
   /** Creates or upgrades the schema. Safe to call on every start. */
-  migrate(): void {
+  migrate(now: number = Date.now()): void {
     this.db.run('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     const current = Number(this.getMeta('schema_version') ?? 0);
     for (let v = current; v < MIGRATIONS.length; v++) {
       this.transaction(() => {
-        for (const statement of MIGRATIONS[v]!) this.db.run(statement);
+        const step = MIGRATIONS[v]!;
+        if (typeof step === 'function') step(this, now);
+        else for (const statement of step) this.db.run(statement);
         this.setMeta('schema_version', String(v + 1));
       });
     }

@@ -34,7 +34,8 @@ export const SYSTEM = {
   coins: {
     maxWatchlistCoins: 16,
     universeRefreshMinutes: 15,
-    dropGraceMinutes: 60
+    /** A watched coin Delta stops trading (delisted or halted) pauses after this long; volume never pauses a coin. */
+    notTradingGraceMinutes: 60
   },
   signal: {
     emaFast: 9,

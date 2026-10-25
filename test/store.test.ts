@@ -20,8 +20,24 @@ describe('Store schema', () => {
     const store = new Store(db);
     store.migrate();
     store.migrate();
-    assert.equal(store.getMeta('schema_version'), '1');
+    assert.equal(store.getMeta('schema_version'), '2');
     assert.equal(db.all<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'probe_minute'")[0]!.n, 0);
+  });
+
+  it('update 2 sets the new-coin timeframes back to 15m once, with an audit line, and leaves fresh installs alone', () => {
+    const { store, db } = fresh();
+    store.saveSettings({ ...DEFAULT_USER_SETTINGS, coins: { ...DEFAULT_USER_SETTINGS.coins, defaultTimeframes: ['1h'] } }, 'user:1', 'new-coin timeframes 15m -> 1h', NOW);
+    store.setMeta('schema_version', '1'); // as the live notebook was before this update
+    const reopened = new Store(db);
+    reopened.migrate(NOW + 1);
+    assert.deepEqual(reopened.settings().coins.defaultTimeframes, ['15m']);
+    const audit = db.all<{ actor: string; change: string }>('SELECT actor, change FROM settings_audit ORDER BY id DESC LIMIT 1');
+    assert.deepEqual(audit, [{ actor: 'update 2', change: 'new-coin timeframes 1h -> 15m (owner request 2026-10-25)' }]);
+    reopened.saveSettings({ ...reopened.settings(), coins: { ...reopened.settings().coins, defaultTimeframes: ['5m'] } }, 'user:1', 'later choice', NOW + 2);
+    reopened.migrate(NOW + 3);
+    assert.deepEqual(reopened.settings().coins.defaultTimeframes, ['5m'], 'runs only once: later choices stand');
+    const blank = fresh();
+    assert.equal(blank.db.all<{ n: number }>('SELECT COUNT(*) AS n FROM settings')[0]!.n, 0, 'a fresh install keeps the built-in default (15m) without writing');
   });
 
   it('rolls back everything written inside a failed transaction', () => {

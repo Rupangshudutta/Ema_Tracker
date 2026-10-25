@@ -16,7 +16,8 @@ Plus a daily "I'm alive" report, start and stop messages, warnings when Delta or
 and the menu: status, settings, top gainers / losers / highest volume, pause, and a coin-picker mini app with per-coin
 timeframes (1m, 3m, 5m, 15m, 1h, 4h).
 
-Coins above your volume filter (default $10M, 24 h) join the watchlist automatically on 15m, up to 16 coins. One margin
+Coins above your volume filter (default $10M, 24 h) join the watchlist automatically on 15m, up to 16 coins, and stay
+until you remove them: a volume drop never pauses or removes a coin. One margin
 (0.00 to 0.10%, default 0.05%) applies to every coin, timeframe and alert type.
 
 ## How it runs

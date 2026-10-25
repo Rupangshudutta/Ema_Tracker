@@ -100,21 +100,40 @@ describe('watchlist rules', () => {
     assert.equal(ch.rows.length, 0);
   });
 
-  it('pauses a coin only after the grace period below the filter, then resumes it with its timeframes', () => {
-    const u = universe(t('A', 8e6));
-    const first = applyUniverse([row('A', { timeframes: ['5m', '1h'] })], u, s, NOW, 60 * 60_000);
+  it('keeps a watched coin whose volume drops, for days: only the owner removes coins', () => {
+    const lowVolume = universe(t('A', 2e6));
+    for (const after of [0, 61 * 60_000, 3 * 24 * 60 * 60_000]) {
+      const ch = applyUniverse([row('A', { timeframes: ['3m', '15m'] })], lowVolume, s, NOW + after, 60 * 60_000);
+      assert.equal(ch.rows.length, 0, 'nothing about the coin changes');
+      assert.equal(ch.paused.length, 0);
+    }
+  });
+
+  it('a raised volume filter never pauses coins already watched; it only limits new ones', () => {
+    const higher = { ...s, coins: { ...s.coins, volumeThresholdUsd: 20e6 } };
+    const ch = applyUniverse([row('A')], universe(t('A', 15e6), t('NEW', 15e6)), higher, NOW, 60 * 60_000);
+    assert.equal(ch.rows.length, 0);
+    assert.equal(ch.joined.length, 0, '15M is below the new 20M filter, so NEW does not join');
+  });
+
+  it('pauses only when Delta stops trading the coin (after the grace), and resumes it when trading restarts', () => {
+    const halted = universe(t('A', 50e6, 'halted'));
+    const first = applyUniverse([row('A', { timeframes: ['5m', '1h'] })], halted, s, NOW, 60 * 60_000);
     assert.equal(first.rows[0]!.belowSince, NOW);
     assert.equal(first.paused.length, 0);
-    const later = applyUniverse([first.rows[0]!], u, s, NOW + 61 * 60_000, 60 * 60_000);
+    const later = applyUniverse([first.rows[0]!], halted, s, NOW + 61 * 60_000, 60 * 60_000);
     assert.equal(later.rows[0]!.status, 'paused');
-    const back = applyUniverse([later.rows[0]!], universe(t('A', 12e6)), s, NOW + 2 * 60 * 60_000, 60 * 60_000);
-    assert.deepEqual(back.resumed, ['A']);
+    const delisted = applyUniverse([first.rows[0]!], universe(), s, NOW + 61 * 60_000, 60 * 60_000);
+    assert.deepEqual(delisted.paused, [{ symbol: 'A', turnoverUsd24h: null }]);
+    const back = applyUniverse([later.rows[0]!], universe(t('A', 1e6)), s, NOW + 2 * 60 * 60_000, 60 * 60_000);
+    assert.deepEqual(back.resumed, ['A'], 'trading again: back, even with low volume');
     assert.deepEqual(back.rows[0]!.timeframes, ['5m', '1h']);
   });
 
-  it('pauses at once when the user raises the filter (grace 0)', () => {
-    const ch = applyUniverse([row('A')], universe(t('A', 15e6)), { ...s, coins: { ...s.coins, volumeThresholdUsd: 20e6 } }, NOW, 0);
-    assert.equal(ch.rows[0]!.status, 'paused');
+  it('brings back coins an older version paused for low volume', () => {
+    const ch = applyUniverse([row('IRYSUSD', { status: 'paused', timeframes: ['3m', '15m'], belowSince: NOW - 60 * 60_000 })], universe(t('IRYSUSD', 4e6)), s, NOW, 60 * 60_000);
+    assert.deepEqual(ch.resumed, ['IRYSUSD']);
+    assert.equal(ch.rows[0]!.status, 'active');
   });
 
   it('lets the user tick timeframes, remove coins and re-add them, within the filter and the cap', () => {
