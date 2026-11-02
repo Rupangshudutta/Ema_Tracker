@@ -66,6 +66,8 @@ export interface EngineStatus {
   version: string;
   role: Role;
   roleReason: string;
+  /** True until the first run has decided the role (a second or so after a restart). */
+  starting: boolean;
   configProblems: string[];
   /** Random, non-secret ID of this engine's notebook. */
   instance: string;
@@ -87,6 +89,7 @@ export interface EngineStatus {
 }
 
 const MINUTE_MS = 60_000;
+const ON_DEMAND_RETRY_MS = 30_000;
 const SETTLE_MS = SYSTEM.timing.settleSeconds * 1000;
 const UNIVERSE_EVERY_MS = SYSTEM.coins.universeRefreshMinutes * MINUTE_MS;
 const NOT_TRADING_GRACE_MS = SYSTEM.coins.notTradingGraceMinutes * MINUTE_MS;
@@ -191,6 +194,8 @@ export class Engine {
   private publicCheckAt = 0;
   private otherEngineAtPublicUrl = false;
   private tickersAt = 0;
+  /** Last failed on-demand ticker fetch: screens skip Delta for a while after one, so taps stay quick while it is down. */
+  private tickersFailedAt = 0;
 
   constructor(store: Store, host: EngineHost, env: RuntimeEnv | null, configProblems: string[]) {
     this.store = store;
@@ -665,36 +670,63 @@ export class Engine {
 
   // ================================================================ coins and watchlist
 
-  private async refreshUniverse(now: number, budget: Budget): Promise<boolean> {
+  /**
+   * `onDemand` (a screen the owner opened): the result does not start or end the "Delta API not answering" warning,
+   * which only the minute run's own calls decide; a one-off failure here would otherwise raise a false alarm 5 minutes
+   * later, since the minute run may make no Delta call for 15 minutes. A 429 still sets the backoff. One retry at most.
+   */
+  private async fetchTickers(now: number, budget: Budget, onDemand = false): Promise<boolean> {
     if (now < this.restBackoffUntil) return false;
-    const r = await this.delta(budget).tickers();
+    const r = await this.delta(budget, onDemand ? 1 : undefined).tickers();
     if (!r.ok) {
-      this.restFailed(r.error, 'tickers', now);
+      this.restFailed(r.error, 'tickers', now, !onDemand);
       return false;
     }
-    this.restSucceeded(r.serverNow, false); // the ticker list may come from Delta's cache, with an old Date header
+    if (!onDemand) this.restSucceeded(r.serverNow, false); // the ticker list may come from Delta's cache, with an old Date header
     this.universe = new Map(r.value.tickers.map(t => [t.symbol, t]));
-    this.universeAt = now;
     this.tickersAt = now;
     return true;
   }
 
+  private async refreshUniverse(now: number, budget: Budget): Promise<boolean> {
+    if (!(await this.fetchTickers(now, budget))) return false;
+    this.universeAt = now;
+    return true;
+  }
+
   /**
-   * Top gainers, top losers or highest volume over 24 h (the v1 bot's lists), from a fresh ticker snapshot when the
-   * cached one is over a minute old. Gainers and losers skip coins under the list's minimum volume, because Delta
-   * lists many near-dead coins whose percentages mean little.
+   * Makes the ticker snapshot at most a minute old, for screens the owner opens (market lists, coin picker, chat Coins
+   * screen). Without it the coin picker is empty after a restart until the next minute run. False when Delta could not
+   * be asked or failed: the caller then shows the last snapshot, which may be empty. One retry at most, and none for
+   * 30 s after a failure, so a tap never waits long while Delta is down.
+   */
+  async freshTickers(): Promise<boolean> {
+    const now = this.now();
+    if (now - this.tickersAt <= MINUTE_MS) return true;
+    if (now - this.tickersFailedAt < ON_DEMAND_RETRY_MS) return false;
+    const ok = await this.fetchTickers(now, new Budget(2), true);
+    if (!ok) this.tickersFailedAt = now; // also during a backoff, when Delta was not asked
+    return ok;
+  }
+
+  /** False when the last refresh tried for a screen failed and no ticker list has arrived since (the list may be incomplete). */
+  tickersAnswered(): boolean {
+    return this.tickersFailedAt <= this.tickersAt;
+  }
+
+  /** Before adding a coin (its volume is checked): a fresh snapshot, unless the coin is already on the watchlist. */
+  async freshTickersToAdd(symbol: string): Promise<void> {
+    const w = this.watchBySymbol.get(symbol);
+    if (!w || w.status === 'removed') await this.freshTickers();
+  }
+
+  /**
+   * Top gainers, top losers or highest volume over 24 h (the v1 bot's lists), from a ticker snapshot at most a minute
+   * old. Gainers and losers skip coins under the list's minimum volume, because Delta lists many near-dead coins whose
+   * percentages mean little.
    */
   async topList(kind: TopListKind): Promise<{ items: DeltaTicker[]; at: number; minVolumeUsd: number }> {
-    const now = this.now();
-    if (now - this.tickersAt > MINUTE_MS && now >= this.restBackoffUntil) {
-      const r = await this.delta(new Budget(4)).tickers();
-      if (r.ok) {
-        this.universe = new Map(r.value.tickers.map(t => [t.symbol, t]));
-        this.tickersAt = now;
-      } else {
-        this.restFailed(r.error, 'tickers', now);
-      }
-    }
+    await this.freshTickers();
     const minVolumeUsd = SYSTEM.market.topListMinVolumeUsd;
     const live = [...this.universe.values()].filter(t => t.tradingStatus === 'operational');
     const items =
@@ -1109,6 +1141,7 @@ export class Engine {
       version: this.host.version,
       role: this.role,
       roleReason: this.roleReason,
+      starting: !this.roleKnown,
       configProblems: this.configProblems,
       instance: this.instanceId,
       startedAt: this.startedAt,
@@ -1223,8 +1256,8 @@ export class Engine {
 
   // ================================================================ plumbing
 
-  private delta(budget: Budget): DeltaClient {
-    const retries = this.host.callBudget === Number.POSITIVE_INFINITY ? SYSTEM.exchange.maxRetries : 1;
+  private delta(budget: Budget, maxRetries?: number): DeltaClient {
+    const retries = maxRetries ?? (this.host.callBudget === Number.POSITIVE_INFINITY ? SYSTEM.exchange.maxRetries : 1);
     return new DeltaClient(budget.wrap(this.host.fetch), undefined, { ...SYSTEM.exchange, maxRetries: retries });
   }
 
@@ -1246,10 +1279,11 @@ export class Engine {
     }
   }
 
-  private restFailed(error: DeltaFailure, what: string, now: number): void {
+  /** `track` false: recorded and printed, but does not start the "Delta API not answering" warning (see fetchTickers). */
+  private restFailed(error: DeltaFailure, what: string, now: number, track = true): void {
     this.count(error.kind === 'rate-limited' ? 'rest_429' : 'rest_fail');
     this.restLastError = `${what}: ${describeDelta(error)}`;
-    this.restFailingSince ??= now;
+    if (track) this.restFailingSince ??= now;
     if (error.kind === 'rate-limited') this.restBackoffUntil = Math.max(this.restBackoffUntil, now + error.retryAfterMs);
     this.print(`Delta ${this.restLastError}`);
   }

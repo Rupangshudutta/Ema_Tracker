@@ -103,13 +103,27 @@ async function coins(request: Request, engine: Engine): Promise<Response> {
   const summary = (): Record<string, unknown> => {
     const s = engine.settings();
     const st = engine.status();
-    return { volumeThresholdUsd: s.coins.volumeThresholdUsd, marginPct: s.signal.marginPct, defaultTimeframes: s.coins.defaultTimeframes, active: st.coins.active, cap: SYSTEM.coins.maxWatchlistCoins, role: st.role, runtime: st.runtime };
+    return { volumeThresholdUsd: s.coins.volumeThresholdUsd, marginPct: s.signal.marginPct, defaultTimeframes: s.coins.defaultTimeframes, active: st.coins.active, cap: SYSTEM.coins.maxWatchlistCoins, role: st.role, starting: st.starting, runtime: st.runtime, pricesFresh: engine.tickersAnswered() };
   };
-  if (request.method === 'GET') return json({ ...summary(), coins: engine.coinList() });
+  // Every coin above the filter, from a snapshot at most a minute old (empty after a restart without this).
+  if (request.method === 'GET') {
+    await engine.freshTickers();
+    return json({ ...summary(), coins: engine.coinList() });
+  }
 
-  if (engine.status().role !== 'active') return json({ error: 'Cloudflare is on standby (the Docker spare is sending alerts). Use /watch in the chat instead.' }, 409);
+  const notActive = (): Response | null => {
+    const st = engine.status();
+    if (st.role === 'active') return null;
+    return json({ error: st.starting ? 'The bot is starting: try again in a few seconds.' : 'Cloudflare is on standby (the Docker spare is sending alerts). Use /watch in the chat instead.' }, 409);
+  };
+  const refused = notActive();
+  if (refused) return refused;
   const body = (await readJson(request)) as { symbol?: unknown; timeframes?: unknown } | undefined;
   if (!body || typeof body.symbol !== 'string' || !Array.isArray(body.timeframes) || !body.timeframes.every(t => typeof t === 'string')) return json({ error: 'Bad request' }, 400);
+  if (body.timeframes.length) await engine.freshTickersToAdd(body.symbol);
+  // Checked again after the wait: the role may have moved to the Docker spare meanwhile, which would then overwrite the edit.
+  const late = notActive();
+  if (late) return late;
   const r = engine.setCoinTimeframes(body.symbol, body.timeframes as string[], `user:${auth.userId} (mini app)`);
   if (!r.ok) return json({ error: r.reason }, 422);
   return json({ ok: true, message: r.message, coin: engine.coinList().find(c => c.symbol === body.symbol) ?? null, ...summary() });

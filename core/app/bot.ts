@@ -152,7 +152,8 @@ function statusScreen(engine: Engine): Screen {
   return { html: renderStatus(engine.status(), engine.now()), keyboard: { inline_keyboard: [[button('🔄 Refresh', 'st')], back()] } };
 }
 
-function coinsScreen(engine: Engine): Screen {
+async function coinsScreen(engine: Engine): Promise<Screen> {
+  await engine.freshTickers(); // volumes for the list
   const watch = engine.watchRows();
   const active = watch.filter(w => w.status === 'active');
   const paused = watch.filter(w => w.status === 'paused');
@@ -220,7 +221,7 @@ async function onCallback(engine: Engine, data: string, actor: string): Promise<
     case 'hp':
       return { screen: helpScreen(engine) };
     case 'co':
-      return { screen: coinsScreen(engine) };
+      return { screen: await coinsScreen(engine) };
     case 'm': {
       const margin = Number(value);
       const r = engine.updateSettings(`margin ${engine.settings().signal.marginPct} -> ${margin}`, actor, s => ({ ...s, signal: { marginPct: margin } }));
@@ -316,7 +317,7 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
     case '/settings':
       return show(settingsScreen(engine));
     case '/coins':
-      return show(coinsScreen(engine));
+      return show(await coinsScreen(engine));
     case '/help':
       return show(helpScreen(engine));
     case '/watch':
@@ -325,6 +326,7 @@ export async function handleUpdate(engine: Engine, tg: TelegramClient, update: T
       if (!/^[A-Z0-9_.-]{2,40}$/.test(symbol)) return send(`Which coin? For example <code>${command} BTCUSD${command === '/watch' ? ' 5m 15m' : ''}</code>`);
       const tfs = command === '/unwatch' ? [] : args.slice(1).map(a => a.toLowerCase());
       if (command === '/watch' && !tfs.length) return send(`Which timeframes? For example <code>/watch BTCUSD 5m 15m</code> (${TIMEFRAMES.join(', ')}).`);
+      if (tfs.length) await engine.freshTickersToAdd(symbol); // adding a coin checks its volume
       const r = engine.setCoinTimeframes(symbol, tfs, actor);
       return send(r.ok ? `✅ ${escapeHtml(r.message)}` : `❌ ${escapeHtml(r.reason)}`);
     }

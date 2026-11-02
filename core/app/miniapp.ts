@@ -131,7 +131,8 @@ export const MINI_APP_JS = String.raw`(function () {
     var m = state.meta;
     if (!m) return;
     meta.textContent = 'Above ' + usd(m.volumeThresholdUsd) + ' volume · margin ' + Number(m.marginPct).toFixed(2) + '% · watching ' + m.active + '/' + m.cap +
-      (m.role === 'active' ? '' : ' · on standby, changes go through the Docker spare');
+      (m.role === 'active' ? '' : m.starting ? ' · starting, changes possible in a few seconds' : ' · on standby, changes go through the Docker spare') +
+      (m.pricesFresh === false ? ' · Delta did not answer just now, so the list may be incomplete: close and reopen to retry' : '');
   }
   function visible(c) {
     var q = state.query.trim().toUpperCase();
@@ -145,7 +146,9 @@ export const MINI_APP_JS = String.raw`(function () {
     list.textContent = '';
     var shown = state.coins.filter(visible);
     if (!shown.length) {
-      list.appendChild(el('div', 'empty', state.coins.length ? 'No coin matches.' : 'No coins above the volume filter right now.'));
+      list.appendChild(el('div', 'empty', state.coins.length ? 'No coin matches.'
+        : state.meta && state.meta.pricesFresh === false ? 'Could not load the coin list from Delta. Close and reopen to try again.'
+        : 'No coins above the volume filter right now.'));
       return;
     }
     shown.forEach(function (c) {
