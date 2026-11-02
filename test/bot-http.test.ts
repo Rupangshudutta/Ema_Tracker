@@ -142,7 +142,7 @@ describe('HTTP routes', () => {
     const page = await handleHttp(new Request(`${BASE}/app`), engine);
     assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self' https:\/\/telegram\.org/);
     const script = await (await handleHttp(new Request(`${BASE}/app.js`), engine)).text();
-    assert.ok(script.includes('var TFS = ["1m","3m","5m","15m","1h","4h"];'), 'the coin picker offers all six timeframes');
+    assert.ok(script.includes('var TFS = ["1m","3m","5m","15m","30m","1h","4h"];'), 'the coin picker offers all seven timeframes');
     assert.ok(script.includes('tg.openLink(url)'), 'chart buttons open outside Telegram');
     const btc = (body.coins as unknown as { symbol: string; chartUrl: string; deltaUrl: string }[]).find(c => c.symbol === 'BTCUSD')!;
     assert.equal(btc.chartUrl, 'https://www.tradingview.com/chart/?symbol=DELTAIN%3ABTCUSD.P&interval=15');

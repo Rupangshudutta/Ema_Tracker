@@ -4,7 +4,7 @@
 import { SYSTEM, type Timeframe } from '../config/settings.ts';
 
 /** TradingView's interval codes for our timeframes (minutes). */
-const TRADINGVIEW_INTERVAL: Readonly<Record<Timeframe, string>> = { '1m': '1', '3m': '3', '5m': '5', '15m': '15', '1h': '60', '4h': '240' };
+const TRADINGVIEW_INTERVAL: Readonly<Record<Timeframe, string>> = { '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240' };
 
 /** TradingView chart of a Delta India perpetual, opened on `timeframe` (15m unless an alert says otherwise). */
 export function tradingViewUrl(symbol: string, timeframe: Timeframe = SYSTEM.links.defaultChartTimeframe): string {

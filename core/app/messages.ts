@@ -200,7 +200,7 @@ export function renderMissed(items: readonly { payload: AlertPayload; eventAt: n
 const n = (v: number | undefined): string => (v ?? 0).toLocaleString('en-US');
 
 function settingsLine(s: UserSettings): string {
-  return `Margin ${s.signal.marginPct.toFixed(2)}% · volume filter ${fmtUsd(s.coins.volumeThresholdUsd)} · new coins on ${s.coins.defaultTimeframes.join(', ')} · cancel notes ${s.realtime.cancelNotes ? 'on' : 'off'} · daily report ${s.monitoring.dailyReportTime} ${tzLabel(s.monitoring.timeZone)}`;
+  return `Margin ${s.signal.marginPct.toFixed(2)}% · volume filter ${fmtUsd(s.coins.volumeThresholdUsd)} · removal ${s.coins.removal === 'auto' ? 'Auto' : 'Manual'} · new coins on ${s.coins.defaultTimeframes.join(', ')} · cancel notes ${s.realtime.cancelNotes ? 'on' : 'off'} · daily report ${s.monitoring.dailyReportTime} ${tzLabel(s.monitoring.timeZone)}`;
 }
 
 function feedLine(st: EngineStatus, now: number): string {
@@ -302,6 +302,11 @@ export const notes = {
   paused(symbols: readonly { symbol: string; turnoverUsd24h: number | null }[]): string {
     const list = symbols.map(s => `${escapeHtml(s.symbol)}${s.turnoverUsd24h === null ? ' (no longer listed)' : ''}`).join(', ');
     return `⏸ <b>Paused</b>: Delta is not trading ${list} right now (delisted or halted), so there are no prices to watch. ${symbols.length === 1 ? 'It stays' : 'They stay'} on your watchlist and resume on the same timeframes when trading restarts.`;
+  },
+  autoRemoved(coins: readonly { symbol: string; turnoverUsd24h: number }[], thresholdUsd: number, hours: number, newCoinTfs: readonly Timeframe[]): string {
+    const list = coins.map(c => `${escapeHtml(c.symbol)} (${fmtUsd(c.turnoverUsd24h)})`).join(', ');
+    const one = coins.length === 1;
+    return `🧹 <b>Removed</b> (Removal: Auto): ${list}. 24 h volume below your ${fmtUsd(thresholdUsd)} filter for ${hours} h or more, so no more alerts and the live feed is closed. ${one ? 'It joins' : 'They join'} again by ${one ? 'itself' : 'themselves'} on ${tfList(newCoinTfs)} when ${one ? 'its' : 'their'} volume is back above the filter. Switch to Manual in Settings to keep coins until you remove them.`;
   },
   resumed(symbols: readonly string[]): string {
     return `▶️ <b>Resumed</b>: ${symbols.map(escapeHtml).join(', ')} ${symbols.length === 1 ? 'is' : 'are'} trading on Delta again.`;

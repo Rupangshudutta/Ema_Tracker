@@ -62,7 +62,8 @@ Alert labels: ⚡ **REALTIME** (candle still open), ↩️ **REALTIME CANCELLED*
 | --- | --- | --- |
 | ⚠️ Live price feed down | Delta's live prices stopped for 5+ min. Realtime alerts fall back to a once-a-minute price check; confirmed alerts are unaffected | None; it reconnects by itself (waiting longer between tries if Delta refuses) |
 | ⚠️ Delta API not answering | Candle checks fail for 5+ min | None; confirmed alerts catch up marked LATE |
-| ⏸ Paused: Delta is not trading COIN | Delta delisted or halted the coin for an hour (volume never pauses a coin; only you remove coins) | None; it resumes on the same timeframes when trading restarts |
+| ⏸ Paused: Delta is not trading COIN | Delta delisted or halted the coin for an hour (volume never pauses a coin) | None; it resumes on the same timeframes when trading restarts |
+| 🧹 Removed (Removal: Auto): COIN | Settings > Removal is Auto and the coin's 24 h volume stayed below your filter for 4 h | None; it joins again by itself on your new-coin timeframe when its volume is back above the filter. Set Removal to Manual to keep coins until you remove them |
 | Healthchecks email "down" | The active engine stopped pinging, or reports a problem | Open `/health` and read `problems`; if Cloudflare is down, start the Docker spare (below) |
 | Nothing at all, no daily report | Secrets missing, or no engine holds the Telegram connection | Open `/health`; `roleReason` says why |
 
@@ -109,6 +110,10 @@ docker compose -f runtimes/docker/compose.yaml down
 ```
 
 `down` keeps the data volume (`ema-tracker_ema-data`). To update after pulling new code, run the `up -d --build` command again.
+
+**Rebuild the spare after every deploy.** Cloudflare updates by itself; the spare only when you rebuild it. A spare on older code may not understand newer settings: from the 2026-11-02 version on it then says "⚠️ Docker spare out of date" in the chat (once) and lists it under `problems` on its health page. A spare built before 2026-11-02 only writes it to its log, so rebuild it now. Do not use `/use_docker` until it is rebuilt.
+
+**Rolling back** to code from before 2026-11-02 (or running a spare that is not rebuilt): first set Removal to Manual, set New coins to a timeframe other than 30m, and take 30m off every coin. Older code knows neither `removal: auto` nor 30m: with either in the settings it starts from the default settings, and a coin watched only on 30m loses its timeframes.
 
 ## Testing on your PC (`npm run cf:dev`)
 

@@ -20,7 +20,7 @@ describe('Store schema', () => {
     const store = new Store(db);
     store.migrate();
     store.migrate();
-    assert.equal(store.getMeta('schema_version'), '2');
+    assert.equal(store.getMeta('schema_version'), '3');
     assert.equal(db.all<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'probe_minute'")[0]!.n, 0);
   });
 
@@ -28,6 +28,7 @@ describe('Store schema', () => {
     const { store, db } = fresh();
     store.saveSettings({ ...DEFAULT_USER_SETTINGS, coins: { ...DEFAULT_USER_SETTINGS.coins, defaultTimeframes: ['1h'] } }, 'user:1', 'new-coin timeframes 15m -> 1h', NOW);
     store.setMeta('schema_version', '1'); // as the live notebook was before this update
+    db.run('ALTER TABLE watch DROP COLUMN low_since'); // added by update 3
     const reopened = new Store(db);
     reopened.migrate(NOW + 1);
     assert.deepEqual(reopened.settings().coins.defaultTimeframes, ['15m']);
@@ -38,6 +39,20 @@ describe('Store schema', () => {
     assert.deepEqual(reopened.settings().coins.defaultTimeframes, ['5m'], 'runs only once: later choices stand');
     const blank = fresh();
     assert.equal(blank.db.all<{ n: number }>('SELECT COUNT(*) AS n FROM settings')[0]!.n, 0, 'a fresh install keeps the built-in default (15m) without writing');
+  });
+
+  it('update 3 adds the volume-dip column to existing watch rows, which read as "no dip"', () => {
+    const { store, db } = fresh();
+    db.run('ALTER TABLE watch DROP COLUMN low_since');
+    store.setMeta('schema_version', '2'); // the live notebook before this update
+    db.run("INSERT INTO watch (symbol, timeframes, origin, status, below_since, updated_at) VALUES ('BTCUSD', '5m', 'user', 'active', NULL, 1)");
+    const reopened = new Store(db);
+    reopened.migrate(NOW);
+    assert.equal(reopened.getMeta('schema_version'), '3');
+    assert.deepEqual(reopened.watchList().map(w => [w.symbol, w.timeframes, w.lowVolumeSince]), [['BTCUSD', ['5m'], null]]);
+    // Code from before this update names its columns, so it still writes to the new table.
+    db.run("INSERT INTO watch (symbol, timeframes, origin, status, below_since, updated_at) VALUES ('ETHUSD', '15m', 'auto', 'active', NULL, 2)");
+    assert.equal(reopened.watchList().find(w => w.symbol === 'ETHUSD')?.lowVolumeSince, null);
   });
 
   it('rolls back everything written inside a failed transaction', () => {
@@ -83,9 +98,11 @@ describe('Store settings', () => {
 describe('Store watchlist and signal state', () => {
   it('round-trips watch rows and series records', () => {
     const { store } = fresh();
-    store.saveWatch({ symbol: 'BTCUSD', timeframes: ['5m', '15m'], origin: 'user', status: 'active', belowSince: null, updatedAt: NOW });
-    store.saveWatch({ symbol: 'XAUTUSD', timeframes: [], origin: 'auto', status: 'removed', belowSince: null, updatedAt: NOW });
-    assert.deepEqual(store.watchList().map(w => [w.symbol, w.timeframes, w.status]), [['BTCUSD', ['5m', '15m'], 'active'], ['XAUTUSD', [], 'removed']]);
+    store.saveWatch({ symbol: 'BTCUSD', timeframes: ['5m', '15m'], origin: 'user', status: 'active', belowSince: null, lowVolumeSince: NOW - 60_000, updatedAt: NOW });
+    store.saveWatch({ symbol: 'XAUTUSD', timeframes: [], origin: 'auto', status: 'removed', belowSince: null, lowVolumeSince: null, updatedAt: NOW });
+    assert.deepEqual(store.watchList().map(w => [w.symbol, w.timeframes, w.status, w.lowVolumeSince]), [['BTCUSD', ['5m', '15m'], 'active', NOW - 60_000], ['XAUTUSD', [], 'removed', null]]);
+    store.deleteWatch('XAUTUSD');
+    assert.deepEqual(store.watchList().map(w => w.symbol), ['BTCUSD']);
 
     const rec = {
       symbol: 'BTCUSD',
@@ -104,12 +121,14 @@ describe('Store watchlist and signal state', () => {
 
   it('exports and imports the portable state (settings and watchlist)', () => {
     const a = fresh().store;
-    a.saveSettings({ ...DEFAULT_USER_SETTINGS, coins: { volumeThresholdUsd: 20e6, defaultTimeframes: ['5m'] } }, 'user:1', 'x', NOW);
-    a.saveWatch({ symbol: 'ETHUSD', timeframes: ['1h'], origin: 'user', status: 'active', belowSince: null, updatedAt: NOW });
+    a.saveSettings({ ...DEFAULT_USER_SETTINGS, coins: { volumeThresholdUsd: 20e6, defaultTimeframes: ['5m'], removal: 'auto' } }, 'user:1', 'x', NOW);
+    a.saveWatch({ symbol: 'ETHUSD', timeframes: ['1h'], origin: 'user', status: 'active', belowSince: null, lowVolumeSince: NOW - 5_000, updatedAt: NOW });
     const b = fresh().store;
-    b.saveWatch({ symbol: 'OLDUSD', timeframes: ['15m'], origin: 'auto', status: 'active', belowSince: null, updatedAt: NOW });
+    b.saveWatch({ symbol: 'OLDUSD', timeframes: ['15m'], origin: 'auto', status: 'active', belowSince: null, lowVolumeSince: null, updatedAt: NOW });
     assert.deepEqual(b.importState(JSON.parse(JSON.stringify(a.exportState())), 'sync', NOW), { ok: true });
     assert.equal(b.settings().coins.volumeThresholdUsd, 20e6);
+    assert.equal(b.settings().coins.removal, 'auto', 'the removal mode travels with the settings');
+    assert.equal(b.watchList().find(w => w.symbol === 'ETHUSD')?.lowVolumeSince, NOW - 5_000, 'and the volume dip with the watchlist');
     assert.deepEqual(b.watchList().map(w => w.symbol), ['ETHUSD']);
     assert.equal(b.importState({ settings: { signal: { marginPct: 9 } } as never, watch: [] }, 'sync', NOW).ok, false);
   });

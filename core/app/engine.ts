@@ -20,7 +20,7 @@ import type { PortableState, SeriesRecord, Store, WatchRow } from '../store/stor
 import { syncKey, webhookSecret } from './auth.ts';
 import { handleUpdate } from './bot.ts';
 import { Feed, type FeedOpener, type FeedStatus } from './feed.ts';
-import { notes, renderDailyReport, type AlertPayload, type StartKind, type TickerContext, type TopListKind } from './messages.ts';
+import { fmtUsd, notes, renderDailyReport, type AlertPayload, type StartKind, type TickerContext, type TopListKind } from './messages.ts';
 import { tradingViewUrl } from './links.ts';
 import { deltaLinkFor } from './openapp.ts';
 import { deliver } from './outbox.ts';
@@ -56,6 +56,8 @@ export interface CoinInfo {
   status: WatchRow['status'] | 'available';
   timeframes: Timeframe[];
   qualifies: boolean;
+  /** Removal: Auto: when this watched coin goes if its volume stays below the filter; null when it is not at risk. */
+  autoRemoveAt: number | null;
   /** TradingView chart on 15m, and the coin's Delta Exchange India page. */
   chartUrl: string;
   deltaUrl: string;
@@ -93,6 +95,7 @@ const ON_DEMAND_RETRY_MS = 30_000;
 const SETTLE_MS = SYSTEM.timing.settleSeconds * 1000;
 const UNIVERSE_EVERY_MS = SYSTEM.coins.universeRefreshMinutes * MINUTE_MS;
 const NOT_TRADING_GRACE_MS = SYSTEM.coins.notTradingGraceMinutes * MINUTE_MS;
+const AUTO_REMOVE_MS = SYSTEM.coins.autoRemoveAfterMinutes * MINUTE_MS;
 const MAX_ALERT_AGE_MS = SYSTEM.delivery.maxAlertAgeHours * 60 * MINUTE_MS;
 const PAIR: EmaPair = { fast: SYSTEM.signal.emaFast, slow: SYSTEM.signal.emaSlow };
 /** Candle requests run this many at a time; each may cost 2 calls on Cloudflare (one retry). */
@@ -183,6 +186,9 @@ export class Engine {
   private countersFlushedAt = 0;
   private prunedAt = 0;
   private peerSyncAt = 0;
+  /** Docker: why Cloudflare's settings and watchlist were refused (this spare's code is older), or null. */
+  private syncRejected: string | null = null;
+  private syncRejectedNoted = false;
   private peerFailingSince: number | null = null;
   private peerWarned = false;
 
@@ -612,8 +618,17 @@ export class Engine {
       if (!res.ok) return;
       const state = (await res.json()) as PortableState;
       const r = this.importState(state, 'sync from Cloudflare');
-      if (r.ok) this.peerSyncAt = now;
-      else this.warn('sync', `Cloudflare state rejected: ${r.errors.join('; ')}`);
+      if (r.ok) {
+        this.peerSyncAt = now;
+        this.syncRejected = null;
+        this.syncRejectedNoted = false;
+      } else {
+        this.warn('sync', `Cloudflare state rejected: ${r.errors.join('; ')}`);
+        this.syncRejected = r.errors.join('; ');
+        // Once in the chat (tried again at the next sync if Telegram failed): the spare would otherwise send alerts
+        // with outdated settings after /use_docker.
+        if (!this.syncRejectedNoted) this.syncRejectedNoted = await this.sendDirect(notes.warning('Docker spare out of date', `It cannot read the settings from Cloudflare (${this.syncRejected}). Rebuild it from the latest code before using /use_docker.`), budget);
+      }
     } catch (err) {
       this.print(`sync with Cloudflare failed: ${errText(err)}`);
     }
@@ -640,11 +655,12 @@ export class Engine {
     await this.sendDirect(notes.peerDown(now - this.peerFailingSince), budget);
   }
 
-  /** Sends a status note right away, outside the outbox (used where the outbox is on standby). */
-  private async sendDirect(html: string, budget: Budget): Promise<void> {
-    if (!this.env) return;
+  /** Sends a status note right away, outside the outbox (used where the outbox is on standby). True when Telegram took it. */
+  private async sendDirect(html: string, budget: Budget): Promise<boolean> {
+    if (!this.env) return false;
     const r = await this.telegram(budget).sendMessage(this.env.telegramChatId, html);
     if (!r.ok) this.telegramFailure(r.error, this.now());
+    return r.ok;
   }
 
   /** Cloudflare: the Docker spare checked in. */
@@ -741,17 +757,28 @@ export class Engine {
   private applyWatchlist(now: number, graceMs: number): void {
     if (!this.universe.size) return;
     const s = this.store.settings();
-    const ch = applyUniverse(this.store.watchList(), this.universe, s, now, graceMs);
+    // Removal: Auto acts only on a ticker list from the last regular check; an older one (a settings change while Delta
+    // is down) still tracks dips but removes nothing.
+    const freshList = now - this.tickersAt <= UNIVERSE_EVERY_MS;
+    const ch = applyUniverse(this.store.watchList(), this.universe, s, now, graceMs, SYSTEM.coins.maxWatchlistCoins, freshList ? AUTO_REMOVE_MS : Number.POSITIVE_INFINITY);
     const capNoted = Number(this.store.getMeta('cap_noted') ?? 0);
     this.store.transaction(() => {
       for (const row of ch.rows) this.store.saveWatch(row);
+      for (const r of ch.removed) {
+        this.store.deleteWatch(r.symbol);
+        this.store.deleteSeries(r.symbol);
+        this.store.audit(now, 'removal auto', `${r.symbol} removed: below the ${fmtUsd(s.coins.volumeThresholdUsd)} volume filter for ${SYSTEM.coins.autoRemoveAfterMinutes / 60} h or more`);
+      }
+      for (const j of ch.joined) this.store.deleteSeries(j.symbol); // a new coin starts from a clean baseline
+      if (ch.removed.length) this.enqueueNote(`autoremoved:${now}`, notes.autoRemoved(ch.removed, s.coins.volumeThresholdUsd, SYSTEM.coins.autoRemoveAfterMinutes / 60, s.coins.defaultTimeframes), now);
       if (ch.joined.length) this.enqueueNote(`joined:${now}`, notes.joined(ch.joined, s.coins.defaultTimeframes), now);
       if (ch.paused.length) this.enqueueNote(`paused:${now}`, notes.paused(ch.paused), now);
       if (ch.resumed.length) this.enqueueNote(`resumed:${now}`, notes.resumed(ch.resumed), now);
       if (ch.overCap > capNoted) this.enqueueNote(`cap:${now}`, notes.capReached(ch.overCap, SYSTEM.coins.maxWatchlistCoins), now);
       if (ch.overCap !== capNoted) this.store.setMeta('cap_noted', String(ch.overCap));
     });
-    if (ch.rows.length) this.reloadWatch();
+    for (const c of [...ch.removed, ...ch.joined]) for (const tf of TIMEFRAMES) this.series.delete(seriesKey(c.symbol, tf));
+    if (ch.rows.length || ch.removed.length) this.reloadWatch();
   }
 
   private reloadWatch(): void {
@@ -784,7 +811,7 @@ export class Engine {
     const out = new Map<string, CoinInfo>();
     for (const t of this.universe.values()) {
       if (!qualifies(t, s)) continue;
-      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true, chartUrl: tradingViewUrl(t.symbol), deltaUrl: deltaLinkFor(this.openPageBase(), t.symbol, t.underlying) });
+      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true, autoRemoveAt: null, chartUrl: tradingViewUrl(t.symbol), deltaUrl: deltaLinkFor(this.openPageBase(), t.symbol, t.underlying) });
     }
     for (const w of this.watch) {
       const t = this.universe.get(w.symbol);
@@ -798,6 +825,7 @@ export class Engine {
         status: w.status,
         timeframes: w.status === 'removed' ? [] : w.timeframes,
         qualifies: ok,
+        autoRemoveAt: s.coins.removal === 'auto' && w.status === 'active' && !ok && w.lowVolumeSince !== null ? w.lowVolumeSince + AUTO_REMOVE_MS : null,
         chartUrl: tradingViewUrl(w.symbol),
         deltaUrl: deltaLinkFor(this.openPageBase(), w.symbol, t?.underlying)
       });
@@ -832,8 +860,9 @@ export class Engine {
       this.series.clear();
       this.followUp(now);
     }
-    // A new filter only changes which new coins join; coins already watched stay.
-    if (before.coins.volumeThresholdUsd !== after.coins.volumeThresholdUsd) this.applyWatchlist(now, NOT_TRADING_GRACE_MS);
+    // A new filter changes which new coins join and, with Removal: Auto, which watched coins are below it; switching
+    // to Auto removes at once the coins already below the filter for long enough.
+    if (before.coins.volumeThresholdUsd !== after.coins.volumeThresholdUsd || before.coins.removal !== after.coins.removal) this.applyWatchlist(now, NOT_TRADING_GRACE_MS);
     if (after.delivery.pausedUntil !== null && after.delivery.pausedUntil > now) this.store.setMeta('pause_noted', '1');
   }
 
@@ -892,7 +921,14 @@ export class Engine {
     }
   }
 
+  /** The coin is still watched on this timeframe: the owner or Removal: Auto can drop it while candles are fetched. */
+  private watching(symbol: string, tf: Timeframe): boolean {
+    const w = this.watchBySymbol.get(symbol);
+    return w !== undefined && w.status === 'active' && w.timeframes.includes(tf);
+  }
+
   private async processSeries(symbol: string, tf: Timeframe, s: UserSettings, budget: Budget, longHistory: boolean): Promise<void> {
+    if (!this.watching(symbol, tf)) return; // dropped since the due list was made
     const key = seriesKey(symbol, tf);
     const interval = TIMEFRAME_MS[tf];
     const margin = s.signal.marginPct;
@@ -955,7 +991,8 @@ export class Engine {
       }
     }
 
-    if (this.series.get(key)?.state !== rec?.state) return;
+    // Dropped while the candles were fetched: writing now would bring back stale state (and alerts) if it joins again.
+    if (!this.watching(symbol, tf) || this.series.get(key)?.state !== rec?.state) return;
     const next: SeriesRecord = { symbol, timeframe: tf, state: res.state, rt: newRealtimeCandle(res.state.lastCloseStart + interval), rtAlertedAt: null };
     const now = this.now();
     this.store.transaction(() => {
@@ -1126,6 +1163,7 @@ export class Engine {
     if (!this.env) problems.push(...this.configProblems);
     if (now - (this.lastMinuteAt ?? this.startedAt) > 3 * MINUTE_MS) problems.push('the minute timer has not run for 3 min');
     if (this.restFailingSince !== null && now - this.restFailingSince >= WARN_AFTER_MS) problems.push(`Delta API failing for ${Math.round((now - this.restFailingSince) / MINUTE_MS)} min`);
+    if (this.syncRejected !== null) problems.push(`Cloudflare settings rejected (rebuild the Docker spare): ${this.syncRejected}`);
     if (this.telegramBlocked) problems.push(`Telegram refuses the bot: ${this.telegramLastError ?? 'unknown'}`);
     if (pending.oldestEventAt !== null && now - pending.oldestEventAt > 10 * MINUTE_MS) problems.push('messages waiting more than 10 min');
     let active = 0;

@@ -14,10 +14,11 @@ Telegram alerts when EMA 9 crosses EMA 15 on **Delta Exchange India** perpetual 
 
 Plus a daily "I'm alive" report, start and stop messages, warnings when Delta or the live feed fails, Healthchecks.io pings,
 and the menu: status, settings, top gainers / losers / highest volume, pause, and a coin-picker mini app with per-coin
-timeframes (1m, 3m, 5m, 15m, 1h, 4h).
+timeframes (1m, 3m, 5m, 15m, 30m, 1h, 4h).
 
-Coins above your volume filter (default $10M, 24 h) join the watchlist automatically on 15m, up to 16 coins, and stay
-until you remove them: a volume drop never pauses or removes a coin. One margin
+Coins above your volume filter (default $10M, 24 h) join the watchlist automatically on 15m (Settings > New coins: 1m
+to 1h), up to 16 coins. Settings > Removal decides what a volume drop does: Manual (default) keeps the coin until you
+remove it; Auto removes it after 4 h below the filter, and it joins again by itself when back above. One margin
 (0.00 to 0.10%, default 0.05%) applies to every coin, timeframe and alert type.
 
 ## How it runs

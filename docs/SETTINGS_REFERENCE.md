@@ -44,13 +44,15 @@ Which coins the bot watches.
 
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
-| `volumeThresholdUsd` | Minimum 24 h trading volume for a coin to join the watchlist by itself (and to be offered in the coin picker). A watched coin whose volume drops stays until you remove it | $10M | $5M, $10M, $15M, $20M, $30M, $50M, $100M | Telegram menu | You |
-| `watchlist` | Each coin's ticked timeframes; a coin with none is removed and gets no alerts or live feed | Every coin above the filter on 15m | Per coin: any of 1m, 3m, 5m, 15m, 1h, 4h, or none | Mini app search | You |
+| `volumeThresholdUsd` | Minimum 24 h trading volume for a coin to join the watchlist by itself (and to be offered in the coin picker). What happens when a watched coin's volume drops below it is `removal` | $10M | $5M, $10M, $15M, $20M, $30M, $50M, $100M | Telegram menu | You |
+| `watchlist` | Each coin's ticked timeframes; a coin with none is removed and gets no alerts or live feed | Every coin above the filter on 15m | Per coin: any of 1m, 3m, 5m, 15m, 30m, 1h, 4h, or none | Mini app search | You |
 | `removedCoins` | Coins you removed; they stay out even while above the filter | none | Any coins | Mini app search | You |
-| `defaultTimeframes` | Timeframes a coin that joins because of its volume starts with (set back to 15m on 2026-10-25 by update 2) | 15m | Any of 1m, 3m, 5m, 15m, 1h, 4h | Telegram menu | You |
+| `defaultTimeframes` | The timeframe a coin that joins because of its volume starts with (set back to 15m on 2026-10-25 by update 2; one choice since 2026-11-02) | 15m | One of 1m, 3m, 5m, 15m, 30m, 1h | Telegram menu (Settings > New coins) | You |
+| `removal` | What happens to a watched coin whose 24 h volume falls below the filter. **Manual**: it stays until you remove it. **Auto**: after `autoRemoveAfterMinutes` below the filter it is removed (no alerts, live feed closed, a note in the chat) and forgotten, so it joins again by itself on the new-coin timeframe when its volume is back above the filter. Applies to every watched coin, also ones you added. Switching to Auto removes at once the coins already below the filter that long | Manual | Manual, Auto | Telegram menu (Settings > Removal) | You |
 | `maxWatchlistCoins` | Most coins on the watchlist at once; extra coins are listed in a note | 16 | Fixed for the free plan | Config file in git | Nobody |
 | `universeRefreshMinutes` | How often the coin list is rebuilt from Delta volumes | 15 | Fixed | Config file in git | Nobody |
 | `notTradingGraceMinutes` | How long Delta must stop trading a watched coin (delisted or halted) before it pauses; it resumes when trading restarts. Volume never pauses a coin | 60 | Fixed | Config file in git | Nobody |
+| `autoRemoveAfterMinutes` | With removal Auto: how long a watched coin must stay below the volume filter before it is removed (checked every `universeRefreshMinutes`; a recovery above the filter restarts the count) | 240 (4 h) | Fixed | Config file in git | Nobody |
 
 ## Signal
 
@@ -59,7 +61,7 @@ The EMA 9/15 rules.
 | Name | What it does | Default | Allowed values | Where it is set | Who changes it |
 | --- | --- | --- | --- | --- | --- |
 | `marginPct` | How far EMA 9 must pass EMA 15 before any alert; one value for every coin, timeframe and alert type | 0.05% | 0.00, 0.01, 0.02 ... 0.10% | Telegram menu | You |
-| `availableTimeframes` | Candle sizes the mini app offers | 1m, 3m, 5m, 15m, 1h, 4h | Fixed | Config file in git | Nobody |
+| `availableTimeframes` | Candle sizes the mini app offers | 1m, 3m, 5m, 15m, 30m, 1h, 4h | Fixed | Config file in git | Nobody |
 | `candleHistory` | Candles fetched per check (enough for exact EMAs) | 150 | Fixed | Config file in git | Nobody |
 | `rebuildHistory` | Candles fetched once if the remembered side is ever lost | 1000 | Fixed | Config file in git | Nobody |
 

@@ -4,7 +4,7 @@
 //   UserSettings values you change from Telegram; validated here before they are stored
 // Secrets and runtime switches are read from the environment in env.ts, never from this file.
 
-export const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1h', '4h'] as const;
+export const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h', '4h'] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
 export const TIMEFRAME_MS: Readonly<Record<Timeframe, number>> = {
@@ -12,12 +12,20 @@ export const TIMEFRAME_MS: Readonly<Record<Timeframe, number>> = {
   '3m': 3 * 60_000,
   '5m': 5 * 60_000,
   '15m': 15 * 60_000,
+  '30m': 30 * 60_000,
   '1h': 60 * 60_000,
   '4h': 4 * 60 * 60_000
 };
 
 /** Margin choices offered in Telegram, in percent (0.00% to 0.10% in 0.01% steps). */
 export const MARGIN_OPTIONS_PCT = [0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1] as const;
+
+/** Timeframes offered for coins that join because of their volume (Settings > New coins; one is chosen). */
+export const NEW_COIN_TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h'] as const satisfies readonly Timeframe[];
+
+/** What happens to a watched coin whose volume falls below the filter (Settings > Removal). */
+export const REMOVAL_MODES = ['manual', 'auto'] as const;
+export type RemovalMode = (typeof REMOVAL_MODES)[number];
 
 /** Volume-filter choices offered in Telegram, in USD of 24 h turnover. */
 export const VOLUME_OPTIONS_USD = [5e6, 10e6, 15e6, 20e6, 30e6, 50e6, 100e6] as const;
@@ -35,7 +43,9 @@ export const SYSTEM = {
     maxWatchlistCoins: 16,
     universeRefreshMinutes: 15,
     /** A watched coin Delta stops trading (delisted or halted) pauses after this long; volume never pauses a coin. */
-    notTradingGraceMinutes: 60
+    notTradingGraceMinutes: 60,
+    /** Removal Auto: a watched coin below the volume filter this long is removed (owner's choice, 2026-11-02). */
+    autoRemoveAfterMinutes: 240
   },
   signal: {
     emaFast: 9,
@@ -82,10 +92,15 @@ export const SYSTEM = {
 
 export interface UserSettings {
   coins: {
-    /** Minimum 24 h volume for a coin to join or stay on the watchlist. */
+    /** Minimum 24 h volume for a coin to join the watchlist by itself (and, with removal 'auto', to stay on it). */
     volumeThresholdUsd: number;
-    /** Timeframes a newly qualifying coin starts with. */
+    /** Timeframes a newly qualifying coin starts with (the menu sets one; older stored lists may hold several). */
     defaultTimeframes: Timeframe[];
+    /**
+     * 'manual': a watched coin stays until the owner removes it. 'auto': a watched coin below the volume filter for
+     * SYSTEM.coins.autoRemoveAfterMinutes is removed, and joins again by itself when it is back above the filter.
+     */
+    removal: RemovalMode;
   };
   signal: {
     /** How far EMA 9 must pass EMA 15, in percent, for every coin, timeframe and alert type. */
@@ -108,12 +123,24 @@ export interface UserSettings {
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
-  coins: { volumeThresholdUsd: 10e6, defaultTimeframes: ['15m'] },
+  coins: { volumeThresholdUsd: 10e6, defaultTimeframes: ['15m'], removal: 'manual' },
   signal: { marginPct: 0.05 },
   realtime: { cancelNotes: true },
   delivery: { pausedUntil: null },
   monitoring: { dailyReportTime: '09:00', timeZone: 'Asia/Kolkata' }
 };
+
+/**
+ * Settings as written to the database and sent to the other runtime. coins.removal is left out while it is 'manual'
+ * (a missing value means Manual), because code from before 2026-11-02 rejects unknown keys: a rollback, or a Docker
+ * spare not yet rebuilt, then keeps the owner's settings as long as Removal is Manual.
+ */
+export function storedSettings(s: UserSettings): Record<string, unknown> {
+  if (s.coins.removal !== 'manual') return { ...s };
+  const coins: Partial<UserSettings['coins']> = { ...s.coins };
+  delete coins.removal;
+  return { ...s, coins };
+}
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; errors: string[] };
 
@@ -142,7 +169,7 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
   if (!isRecord(input)) return { ok: false, errors: ['settings must be an object'] };
   const errors: string[] = [];
   const known: Record<keyof UserSettings, readonly string[]> = {
-    coins: ['volumeThresholdUsd', 'defaultTimeframes'],
+    coins: ['volumeThresholdUsd', 'defaultTimeframes', 'removal'],
     signal: ['marginPct'],
     realtime: ['cancelNotes'],
     delivery: ['pausedUntil'],
@@ -175,6 +202,9 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
     errors.push(`coins.defaultTimeframes must be one or more distinct values from ${TIMEFRAMES.join(', ')}`);
   }
 
+  const removal = coins.removal ?? d.coins.removal;
+  if (!(REMOVAL_MODES as readonly unknown[]).includes(removal)) errors.push(`coins.removal must be one of ${REMOVAL_MODES.join(', ')}`);
+
   const margin = canonical(signal.marginPct ?? d.signal.marginPct, MARGIN_OPTIONS_PCT);
   if (margin === undefined) errors.push(`signal.marginPct must be one of ${MARGIN_OPTIONS_PCT.join(', ')}`);
 
@@ -196,7 +226,7 @@ export function validateUserSettings(input: unknown): ValidationResult<UserSetti
   return {
     ok: true,
     value: {
-      coins: { volumeThresholdUsd: volume!, defaultTimeframes: [...(tfList as Timeframe[])].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]) },
+      coins: { volumeThresholdUsd: volume!, defaultTimeframes: [...(tfList as Timeframe[])].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]), removal: removal as RemovalMode },
       signal: { marginPct: margin! },
       realtime: { cancelNotes: cancelNotes as boolean },
       delivery: { pausedUntil: pausedUntil as number | null },

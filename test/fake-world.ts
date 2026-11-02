@@ -42,6 +42,8 @@ export class FakeWorld {
   cloudflareUp = true;
   /** Calls the Docker spare made to Cloudflare's sync API ("POST /api/sync/heartbeat"). */
   syncCalls: string[] = [];
+  /** What Cloudflare's GET /api/sync/state answers (null: 404). */
+  syncState: unknown = null;
   private feedCallbacks: FeedCallbacks | null = null;
   private messageId = 1000;
   wakes: number[] = [];
@@ -110,6 +112,7 @@ export class FakeWorld {
       }
       if (path.startsWith('/api/sync/')) {
         this.syncCalls.push(`${init?.method ?? 'GET'} ${path}`);
+        if (path === '/api/sync/state' && (init?.method ?? 'GET') === 'GET' && this.syncState !== null) return json(this.syncState);
         return path === '/api/sync/heartbeat' || init?.method === 'PUT' ? json({ ok: true, role: 'standby' }) : json({ error: 'not in this test' }, 404);
       }
       return json({ error: 'not found' }, 404);

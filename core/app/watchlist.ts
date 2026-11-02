@@ -1,7 +1,10 @@
 // Watchlist rules (pure functions; the engine stores the result).
-//   - Coins above the volume filter join automatically on the default timeframes (15m unless changed), up to the cap.
-//   - Once on the watchlist a coin stays until the user removes it: a volume drop never pauses or removes it
-//     (owner's rule, 2026-10-25). The filter only decides which new coins join and what the coin picker offers.
+//   - Coins above the volume filter join automatically on the new-coin timeframe (15m unless changed), up to the cap.
+//   - Removal: Manual (the default): once on the watchlist a coin stays until the user removes it; a volume drop never
+//     pauses or removes it (owner's rule, 2026-10-25).
+//   - Removal: Auto (owner's choice, 2026-11-02): a watched coin trading below the filter for 4 hours in a row is
+//     removed and forgotten, so it joins again by itself, on the new-coin timeframe, once it is back above the
+//     filter. The dip is tracked in both modes, so switching to Auto removes coins that have already been low 4 hours.
 //   - A coin the user removed (all timeframes unticked) stays out, even while it is above the filter.
 //   - Only a coin Delta stops trading (delisted or halted) for the grace period is paused, because there are no
 //     prices to watch; it resumes on the same timeframes when trading restarts. Our own failed ticker fetch never
@@ -17,6 +20,8 @@ export interface WatchlistChange {
   rows: WatchRow[];
   joined: { symbol: string; turnoverUsd24h: number; change24hPct: number }[];
   paused: { symbol: string; turnoverUsd24h: number | null }[];
+  /** Removal: Auto: coins below the filter long enough. Their rows (and signal state) are deleted, not written. */
+  removed: { symbol: string; timeframes: Timeframe[]; turnoverUsd24h: number }[];
   resumed: string[];
   /** Coins that pass the filter but did not fit under the cap. */
   overCap: number;
@@ -34,8 +39,16 @@ export function qualifies(t: DeltaTicker | undefined, s: UserSettings): boolean 
 
 export const sortTimeframes = (tfs: readonly Timeframe[]): Timeframe[] => [...new Set(tfs)].sort((a, b) => TIMEFRAME_MS[a] - TIMEFRAME_MS[b]);
 
-export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: UserSettings, now: number, graceMs: number, cap: number = SYSTEM.coins.maxWatchlistCoins): WatchlistChange {
-  const out: WatchlistChange = { rows: [], joined: [], paused: [], resumed: [], overCap: 0 };
+export function applyUniverse(
+  rows: readonly WatchRow[],
+  universe: Universe,
+  s: UserSettings,
+  now: number,
+  graceMs: number,
+  cap: number = SYSTEM.coins.maxWatchlistCoins,
+  autoRemoveMs: number = SYSTEM.coins.autoRemoveAfterMinutes * 60_000
+): WatchlistChange {
+  const out: WatchlistChange = { rows: [], joined: [], paused: [], resumed: [], removed: [], overCap: 0 };
   const known = new Set(rows.map(r => r.symbol));
   let active = 0;
   const resumable: WatchRow[] = [];
@@ -49,11 +62,16 @@ export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: 
       continue;
     }
     if (trading) {
+      const lowSince = qualifies(t, s) ? null : (row.lowVolumeSince ?? now);
+      if (lowSince !== null && s.coins.removal === 'auto' && now - lowSince >= autoRemoveMs) {
+        out.removed.push({ symbol: row.symbol, timeframes: row.timeframes, turnoverUsd24h: t!.turnoverUsd24h });
+        continue;
+      }
       active++;
-      if (row.belowSince !== null) out.rows.push({ ...row, belowSince: null, updatedAt: now });
+      if (row.belowSince !== null || row.lowVolumeSince !== lowSince) out.rows.push({ ...row, belowSince: null, lowVolumeSince: lowSince, updatedAt: now });
       continue;
     }
-    // belowSince now means "not trading since".
+    // Not trading: the volume dip is left as it is (no fresh volume to judge).
     const since = row.belowSince ?? now;
     if (now - since >= graceMs) {
       out.rows.push({ ...row, status: 'paused', belowSince: since, updatedAt: now });
@@ -71,7 +89,7 @@ export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: 
       continue;
     }
     active++;
-    out.rows.push({ ...row, status: 'active', belowSince: null, updatedAt: now });
+    out.rows.push({ ...row, status: 'active', belowSince: null, lowVolumeSince: null, updatedAt: now }); // a fresh start for Removal: Auto
     out.resumed.push(row.symbol);
   }
 
@@ -82,7 +100,7 @@ export function applyUniverse(rows: readonly WatchRow[], universe: Universe, s: 
       continue;
     }
     active++;
-    out.rows.push({ symbol: t.symbol, timeframes: sortTimeframes(s.coins.defaultTimeframes), origin: 'auto', status: 'active', belowSince: null, updatedAt: now });
+    out.rows.push({ symbol: t.symbol, timeframes: sortTimeframes(s.coins.defaultTimeframes), origin: 'auto', status: 'active', belowSince: null, lowVolumeSince: null, updatedAt: now });
     out.joined.push({ symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct });
   }
   return out;
@@ -103,7 +121,7 @@ export function editCoin(rows: readonly WatchRow[], universe: Universe, s: UserS
   const droppedTimeframes = before.filter(tf => !tfs.includes(tf));
   if (!tfs.length) {
     if (!existing || existing.status === 'removed') return { ok: false, reason: `${symbol} is not on the watchlist` };
-    return { ok: true, row: { ...existing, timeframes: [], origin: 'user', status: 'removed', belowSince: null, updatedAt: now }, droppedTimeframes, message: `${symbol} removed: no more alerts, live feed closed` };
+    return { ok: true, row: { ...existing, timeframes: [], origin: 'user', status: 'removed', belowSince: null, lowVolumeSince: null, updatedAt: now }, droppedTimeframes, message: `${symbol} removed: no more alerts, live feed closed` };
   }
   if (existing && existing.status !== 'removed') {
     return { ok: true, row: { ...existing, timeframes: tfs, origin: 'user', updatedAt: now }, droppedTimeframes, message: `${symbol}: ${tfs.join(', ')}${existing.status === 'paused' ? ' (paused while Delta is not trading it)' : ''}` };
@@ -111,5 +129,5 @@ export function editCoin(rows: readonly WatchRow[], universe: Universe, s: UserS
   if (!qualifies(universe.get(symbol), s)) return { ok: false, reason: `${symbol} is not above your volume filter right now` };
   const active = rows.filter(r => r.status === 'active').length;
   if (active >= cap) return { ok: false, reason: `The watchlist is full (${cap} coins). Remove a coin first.` };
-  return { ok: true, row: { symbol, timeframes: tfs, origin: 'user', status: 'active', belowSince: null, updatedAt: now }, droppedTimeframes, message: `${symbol} added: ${tfs.join(', ')}` };
+  return { ok: true, row: { symbol, timeframes: tfs, origin: 'user', status: 'active', belowSince: null, lowVolumeSince: null, updatedAt: now }, droppedTimeframes, message: `${symbol} added: ${tfs.join(', ')}` };
 }

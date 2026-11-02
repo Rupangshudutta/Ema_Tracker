@@ -1,6 +1,6 @@
 // Telegram menus and commands (S5). Only the configured chat and admin user IDs are answered; anyone else is ignored.
 // Buttons edit the menu message in place, so the chat does not fill up with menus.
-import { MARGIN_OPTIONS_PCT, SYSTEM, TIMEFRAMES, VOLUME_OPTIONS_USD, isTimeframe, type Timeframe } from '../config/settings.ts';
+import { MARGIN_OPTIONS_PCT, NEW_COIN_TIMEFRAMES, REMOVAL_MODES, SYSTEM, TIMEFRAMES, VOLUME_OPTIONS_USD, type RemovalMode, type UserSettings } from '../config/settings.ts';
 import { escapeHtml, type InlineButton, type InlineKeyboard, type TelegramClient, type TelegramUpdate } from '../notify/telegram.ts';
 import type { Engine } from './engine.ts';
 import { fmtDateTime, fmtUsd, renderStatus, renderTopList, tzLabel, type TopListKind } from './messages.ts';
@@ -58,13 +58,24 @@ function mainScreen(engine: Engine): Screen {
   };
 }
 
+const REMOVAL_LABEL: Readonly<Record<RemovalMode, string>> = { manual: 'Manual', auto: 'Auto' };
+const autoHours = SYSTEM.coins.autoRemoveAfterMinutes / 60;
+
+/** What happens to a watched coin whose volume falls below the filter, in one sentence. */
+function removalRule(s: UserSettings): string {
+  return s.coins.removal === 'auto'
+    ? `a watched coin below the filter for ${autoHours} h is removed, and joins again by itself when its volume is back above it`
+    : 'coins already on your watchlist stay until you remove them';
+}
+
 function settingsScreen(engine: Engine): Screen {
   const s = engine.settings();
   return {
     html: [
       '⚙️ <b>Settings</b>',
       `<b>Margin</b> ${s.signal.marginPct.toFixed(2)}%: how far EMA 9 must pass EMA 15 before an alert (all coins, timeframes and alert types).`,
-      `<b>Volume filter</b> ${fmtUsd(s.coins.volumeThresholdUsd)}: coins above this 24 h volume join the watchlist by themselves. Coins already on your watchlist stay until you remove them.`,
+      `<b>Volume filter</b> ${fmtUsd(s.coins.volumeThresholdUsd)}: coins above this 24 h volume join the watchlist by themselves.`,
+      `<b>Removal</b> ${REMOVAL_LABEL[s.coins.removal]}: ${removalRule(s)}.`,
       `<b>New coins start on</b> ${s.coins.defaultTimeframes.join(', ')}.`,
       `<b>Cancel notes</b> ${s.realtime.cancelNotes ? 'on' : 'off'}: a short note when a realtime cross reverses before the close.`,
       `<b>Daily report</b> at ${s.monitoring.dailyReportTime} ${tzLabel(s.monitoring.timeZone)}.`
@@ -72,7 +83,7 @@ function settingsScreen(engine: Engine): Screen {
     keyboard: {
       inline_keyboard: [
         [button(`Margin ${s.signal.marginPct.toFixed(2)}%`, 'nav:m'), button(`Volume ${fmtUsd(s.coins.volumeThresholdUsd)}`, 'nav:v')],
-        [button(`New coins: ${s.coins.defaultTimeframes.join(', ')}`, 'nav:tf')],
+        [button(`New coins: ${s.coins.defaultTimeframes.join(', ')}`, 'nav:tf'), button(`Removal: ${REMOVAL_LABEL[s.coins.removal]}`, 'nav:rm')],
         [button(`Cancel notes: ${s.realtime.cancelNotes ? 'on' : 'off'}`, 'cn'), button(`Report ${s.monitoring.dailyReportTime}`, 'nav:rt')],
         back()
       ]
@@ -97,9 +108,10 @@ function marginScreen(engine: Engine): Screen {
 }
 
 function volumeScreen(engine: Engine): Screen {
-  const current = engine.settings().coins.volumeThresholdUsd;
+  const s = engine.settings();
+  const current = s.coins.volumeThresholdUsd;
   return pickerScreen(
-    `💧 <b>Volume filter</b>\nCoins above this 24 h volume join the watchlist by themselves (up to ${SYSTEM.coins.maxWatchlistCoins}) on your new-coin timeframes. A coin whose volume drops later stays until you remove it.`,
+    `💧 <b>Volume filter</b>\nCoins above this 24 h volume join the watchlist by themselves (up to ${SYSTEM.coins.maxWatchlistCoins}) on your new-coin timeframe. Removal is ${REMOVAL_LABEL[s.coins.removal]}: ${removalRule(s)}.`,
     VOLUME_OPTIONS_USD.map(v => ({ label: fmtUsd(v), data: `v:${v}`, current: v === current })),
     4
   );
@@ -108,9 +120,22 @@ function volumeScreen(engine: Engine): Screen {
 function defaultTfScreen(engine: Engine): Screen {
   const current = engine.settings().coins.defaultTimeframes;
   return pickerScreen(
-    '🕒 <b>Timeframes for new coins</b>\nTap to tick or untick. Coins already on the watchlist keep their own timeframes (change those in Coins).',
-    TIMEFRAMES.map(tf => ({ label: tf, data: `tf:${tf}`, current: current.includes(tf) })),
-    4
+    '🕒 <b>Timeframe for new coins</b>\nCoins that join because of their volume start on this EMA 9/15 timeframe. Coins already on the watchlist keep their own timeframes (change those in Coins).',
+    NEW_COIN_TIMEFRAMES.map(tf => ({ label: tf, data: `tf:${tf}`, current: current.includes(tf) })),
+    3
+  );
+}
+
+function removalScreen(engine: Engine): Screen {
+  const s = engine.settings();
+  return pickerScreen(
+    [
+      '🧹 <b>Removal</b>: what happens to a watched coin whose 24 h volume falls below your volume filter.',
+      '<b>Manual</b>: it stays until you remove it (Coins, or /unwatch).',
+      `<b>Auto</b>: it is removed after ${autoHours} h below the filter (checked every ${SYSTEM.coins.universeRefreshMinutes} min), with a note in the chat, and joins again by itself on your new-coin timeframe when its volume is back above the filter. Coins already below the filter that long go at once.`
+    ].join('\n'),
+    REMOVAL_MODES.map(m => ({ label: REMOVAL_LABEL[m], data: `rm:${m}`, current: m === s.coins.removal })),
+    2
   );
 }
 
@@ -212,6 +237,7 @@ async function onCallback(engine: Engine, data: string, actor: string): Promise<
           : value === 'm' ? marginScreen(engine)
           : value === 'v' ? volumeScreen(engine)
           : value === 'tf' ? defaultTfScreen(engine)
+          : value === 'rm' ? removalScreen(engine)
           : value === 'rt' ? reportTimeScreen(engine)
           : value === 'p' ? pauseScreen()
           : mainScreen(engine)
@@ -233,12 +259,18 @@ async function onCallback(engine: Engine, data: string, actor: string): Promise<
       return r.ok ? { screen: settingsScreen(engine), toast: `Volume filter set to ${fmtUsd(volume)}` } : failed(r.errors);
     }
     case 'tf': {
-      if (!isTimeframe(value)) return { toast: 'Unknown timeframe' };
+      // One timeframe for new coins (owner's choice, 2026-11-02).
+      const tf = NEW_COIN_TIMEFRAMES.find(t => t === value);
+      if (!tf) return { toast: 'Unknown timeframe' };
       const current = engine.settings().coins.defaultTimeframes;
-      const next: Timeframe[] = current.includes(value) ? current.filter(t => t !== value) : [...current, value];
-      if (!next.length) return { toast: 'Keep at least one timeframe' };
-      const r = engine.updateSettings(`new-coin timeframes ${current.join(',')} -> ${next.join(',')}`, actor, s => ({ ...s, coins: { ...s.coins, defaultTimeframes: next } }));
-      return r.ok ? { screen: defaultTfScreen(engine), toast: `New coins: ${engine.settings().coins.defaultTimeframes.join(', ')}` } : failed(r.errors);
+      const r = engine.updateSettings(`new-coin timeframes ${current.join(',')} -> ${tf}`, actor, s => ({ ...s, coins: { ...s.coins, defaultTimeframes: [tf] } }));
+      return r.ok ? { screen: settingsScreen(engine), toast: `New coins start on ${tf}` } : failed(r.errors);
+    }
+    case 'rm': {
+      const mode = REMOVAL_MODES.find(m => m === value);
+      if (!mode) return { toast: 'Unknown removal mode' };
+      const r = engine.updateSettings(`removal ${engine.settings().coins.removal} -> ${mode}`, actor, s => ({ ...s, coins: { ...s.coins, removal: mode } }));
+      return r.ok ? { screen: settingsScreen(engine), toast: mode === 'auto' ? `Removal: Auto (after ${autoHours} h below the filter)` : 'Removal: Manual (coins stay until you remove them)' } : failed(r.errors);
     }
     case 'cn': {
       const on = !engine.settings().realtime.cancelNotes;

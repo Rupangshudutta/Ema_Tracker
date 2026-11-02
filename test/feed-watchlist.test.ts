@@ -85,7 +85,7 @@ describe('watchlist rules', () => {
   const s: UserSettings = DEFAULT_USER_SETTINGS;
   const t = (symbol: string, turnoverUsd24h: number, tradingStatus = 'operational'): DeltaTicker => ({ symbol, underlying: symbol.replace(/USD$/, ''), lastPrice: 1, markPrice: 1, turnoverUsd24h, change24hPct: 0, openInterestUsd: null, tradingStatus, timestampMs: NOW });
   const universe = (...list: DeltaTicker[]) => new Map(list.map(x => [x.symbol, x]));
-  const row = (symbol: string, over: Partial<WatchRow> = {}): WatchRow => ({ symbol, timeframes: ['15m'], origin: 'auto', status: 'active', belowSince: null, updatedAt: 0, ...over });
+  const row = (symbol: string, over: Partial<WatchRow> = {}): WatchRow => ({ symbol, timeframes: ['15m'], origin: 'auto', status: 'active', belowSince: null, lowVolumeSince: null, updatedAt: 0, ...over });
 
   it('adds coins above the filter on the default timeframes, biggest first, up to the cap', () => {
     const u = universe(t('A', 50e6), t('B', 20e6), t('C', 5e6), t('D', 30e6, 'halted'));
@@ -100,20 +100,83 @@ describe('watchlist rules', () => {
     assert.equal(ch.rows.length, 0);
   });
 
-  it('keeps a watched coin whose volume drops, for days: only the owner removes coins', () => {
+  it('Removal: Manual keeps a watched coin whose volume drops, for days: only the owner removes coins', () => {
     const lowVolume = universe(t('A', 2e6));
+    let rows = [row('A', { timeframes: ['3m', '15m'] })];
     for (const after of [0, 61 * 60_000, 3 * 24 * 60 * 60_000]) {
-      const ch = applyUniverse([row('A', { timeframes: ['3m', '15m'] })], lowVolume, s, NOW + after, 60 * 60_000);
-      assert.equal(ch.rows.length, 0, 'nothing about the coin changes');
+      const ch = applyUniverse(rows, lowVolume, s, NOW + after, 60 * 60_000);
+      assert.equal(ch.removed.length, 0);
       assert.equal(ch.paused.length, 0);
+      if (after === 0) assert.deepEqual(ch.rows.map(r => [r.status, r.timeframes, r.lowVolumeSince]), [['active', ['3m', '15m'], NOW]], 'only the start of the dip is noted');
+      else assert.equal(ch.rows.length, 0, 'nothing about the coin changes');
+      rows = rows.map(r => ch.rows.find(c => c.symbol === r.symbol) ?? r);
     }
   });
 
   it('a raised volume filter never pauses coins already watched; it only limits new ones', () => {
     const higher = { ...s, coins: { ...s.coins, volumeThresholdUsd: 20e6 } };
     const ch = applyUniverse([row('A')], universe(t('A', 15e6), t('NEW', 15e6)), higher, NOW, 60 * 60_000);
-    assert.equal(ch.rows.length, 0);
+    assert.deepEqual(ch.rows.map(r => [r.symbol, r.status]), [['A', 'active']]);
+    assert.equal(ch.removed.length, 0);
     assert.equal(ch.joined.length, 0, '15M is below the new 20M filter, so NEW does not join');
+  });
+
+  describe('Removal: Auto', () => {
+    const auto: UserSettings = { ...s, coins: { ...s.coins, removal: 'auto' } };
+    const H = 60 * 60_000;
+    const run = (rows: WatchRow[], u: ReturnType<typeof universe>, at: number, settings = auto) => applyUniverse(rows, u, settings, at, H, 16, 4 * H);
+    const next = (rows: WatchRow[], ch: ReturnType<typeof run>) => rows.filter(r => !ch.removed.some(x => x.symbol === r.symbol)).map(r => ch.rows.find(c => c.symbol === r.symbol) ?? r).concat(ch.rows.filter(c => !rows.some(r => r.symbol === c.symbol)));
+
+    it('removes a coin after 4 h in a row below the filter, not before', () => {
+      const low = universe(t('A', 2e6));
+      let rows = [row('A', { timeframes: ['5m', '15m'], origin: 'user' })];
+      for (const at of [0, H, 3 * H, 4 * H - 1]) {
+        const ch = run(rows, low, NOW + at);
+        assert.equal(ch.removed.length, 0, `still watched ${at / H} h into the dip`);
+        rows = next(rows, ch);
+      }
+      assert.equal(rows[0]!.lowVolumeSince, NOW);
+      const ch = run(rows, low, NOW + 4 * H);
+      assert.deepEqual(ch.removed, [{ symbol: 'A', timeframes: ['5m', '15m'], turnoverUsd24h: 2e6 }], 'user-added coins too (the owner chose this)');
+      assert.equal(ch.rows.length, 0, 'the row is deleted, not written');
+    });
+
+    it('a recovery above the filter restarts the 4 h count', () => {
+      let rows = [row('A')];
+      rows = next(rows, run(rows, universe(t('A', 2e6)), NOW));
+      rows = next(rows, run(rows, universe(t('A', 50e6)), NOW + 3 * H));
+      assert.equal(rows[0]!.lowVolumeSince, null);
+      rows = next(rows, run(rows, universe(t('A', 2e6)), NOW + 3.5 * H));
+      assert.equal(run(rows, universe(t('A', 2e6)), NOW + 7 * H).removed.length, 0, 'only 3.5 h into the new dip');
+      assert.equal(run(rows, universe(t('A', 2e6)), NOW + 7.5 * H).removed.length, 1);
+    });
+
+    it('a removed coin joins again by itself on the new-coin timeframe once it is back above the filter', () => {
+      let rows = [row('A', { timeframes: ['1h'], origin: 'user', lowVolumeSince: NOW - 4 * H })];
+      const gone = run(rows, universe(t('A', 2e6)), NOW);
+      assert.equal(gone.removed.length, 1);
+      rows = next(rows, gone);
+      assert.equal(rows.length, 0);
+      const back = run(rows, universe(t('A', 30e6)), NOW + 15 * 60_000);
+      assert.deepEqual(back.joined.map(j => j.symbol), ['A']);
+      assert.deepEqual(back.rows.map(r => [r.symbol, r.timeframes, r.origin]), [['A', ['15m'], 'auto']]);
+    });
+
+    it('switching from Manual to Auto removes coins already low for 4 h; the cap slot goes to the next coin', () => {
+      let rows = [row('A')];
+      rows = next(rows, run(rows, universe(t('A', 2e6)), NOW, s));
+      const ch = applyUniverse(rows, universe(t('A', 2e6), t('B', 40e6)), auto, NOW + 5 * H, H, 1, 4 * H);
+      assert.deepEqual(ch.removed.map(r => r.symbol), ['A']);
+      assert.deepEqual(ch.joined.map(j => j.symbol), ['B'], 'the freed slot is used at once');
+    });
+
+    it('never removes a coin Delta stops trading (that pauses it) or one the owner removed', () => {
+      const rows = [row('H', { lowVolumeSince: NOW - 10 * H }), row('R', { status: 'removed', timeframes: [] })];
+      const ch = run(rows, universe(t('H', 1e6, 'halted'), t('R', 1e6)), NOW);
+      assert.equal(ch.removed.length, 0);
+      const resumed = run([row('H', { status: 'paused', lowVolumeSince: NOW - 10 * H })], universe(t('H', 1e6)), NOW);
+      assert.deepEqual(resumed.rows.map(r => [r.status, r.lowVolumeSince]), [['active', null]], 'a resumed coin starts a fresh count');
+    });
   });
 
   it('pauses only when Delta stops trading the coin (after the grace), and resumes it when trading restarts', () => {

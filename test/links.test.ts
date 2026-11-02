@@ -8,6 +8,7 @@ describe('chart links', () => {
   it('opens TradingView on 15m by default and on the given timeframe otherwise', () => {
     assert.equal(tradingViewUrl('BTCUSD'), 'https://www.tradingview.com/chart/?symbol=DELTAIN%3ABTCUSD.P&interval=15');
     assert.equal(tradingViewUrl('ETHUSD', '1m'), 'https://www.tradingview.com/chart/?symbol=DELTAIN%3AETHUSD.P&interval=1');
+    assert.equal(tradingViewUrl('ETHUSD', '30m'), 'https://www.tradingview.com/chart/?symbol=DELTAIN%3AETHUSD.P&interval=30');
     assert.equal(tradingViewUrl('ETHUSD', '1h'), 'https://www.tradingview.com/chart/?symbol=DELTAIN%3AETHUSD.P&interval=60');
     assert.equal(tradingViewUrl('ETHUSD', '4h'), 'https://www.tradingview.com/chart/?symbol=DELTAIN%3AETHUSD.P&interval=240');
   });

@@ -2,7 +2,7 @@
 // Write budget: Cloudflare's free plan allows 100,000 written rows a day per account, so only state changes are
 // written (one series row per candle close, outbox rows per message, warnings and errors in the log) and the coin
 // universe is kept in memory and re-fetched after a restart.
-import { DEFAULT_USER_SETTINGS, isTimeframe, validateUserSettings, type Timeframe, type UserSettings } from '../config/settings.ts';
+import { DEFAULT_USER_SETTINGS, isTimeframe, storedSettings, validateUserSettings, type Timeframe, type UserSettings } from '../config/settings.ts';
 import type { Direction, RealtimeCandle, Side, SignalState } from '../domain/signal.ts';
 import type { SqlDriver } from './sql.ts';
 
@@ -48,7 +48,11 @@ const MIGRATIONS: readonly Migration[] = [
     const tfs = s.coins.defaultTimeframes;
     if (tfs.length === 1 && tfs[0] === '15m') return;
     store.saveSettings({ ...s, coins: { ...s.coins, defaultTimeframes: ['15m'] } }, 'update 2', `new-coin timeframes ${tfs.join(',')} -> 15m (owner request 2026-10-25)`, now);
-  }
+  },
+  // 3 (2026-11-02): when a watched coin's volume fell below the filter, for Removal: Auto. A column of its own, because
+  // below_since means "Delta not trading it since" and a coin can be in both states one after the other. Older code
+  // names its columns, so it still runs on this table.
+  ['ALTER TABLE watch ADD COLUMN low_since INTEGER']
 ];
 
 const DAY_MS = 24 * 60 * 60_000;
@@ -65,8 +69,10 @@ export interface WatchRow {
   timeframes: Timeframe[];
   origin: WatchOrigin;
   status: WatchStatus;
-  /** First time the coin was seen below the volume filter in the current dip, or null. */
+  /** First time the coin was seen not trading on Delta in the current stretch, or null (pauses it after the grace period). */
   belowSince: number | null;
+  /** First time the coin was seen trading below the volume filter in the current dip, or null (Removal: Auto). */
+  lowVolumeSince: number | null;
   updatedAt: number;
 }
 
@@ -112,7 +118,8 @@ export interface LogRow {
 
 /** What the Docker spare copies from (and back to) Cloudflare when the engines switch. */
 export interface PortableState {
-  settings: UserSettings;
+  /** As stored (see storedSettings); validated on import. */
+  settings: unknown;
   watch: WatchRow[];
 }
 
@@ -136,6 +143,7 @@ interface WatchDbRow {
   origin: string;
   status: string;
   below_since: number | null;
+  low_since: number | null;
   updated_at: number;
 }
 
@@ -148,6 +156,7 @@ function toWatch(r: WatchDbRow): WatchRow {
     origin: r.origin === 'user' ? 'user' : 'auto',
     status: r.status === 'paused' || r.status === 'removed' ? r.status : 'active',
     belowSince: r.below_since,
+    lowVolumeSince: r.low_since,
     updatedAt: r.updated_at
   };
 }
@@ -233,7 +242,7 @@ export class Store {
     this.transaction(() => {
       this.db.run(
         'INSERT INTO settings (id, json, updated_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at',
-        JSON.stringify(v.value),
+        JSON.stringify(storedSettings(v.value)),
         now
       );
       this.db.run('INSERT INTO settings_audit (at, actor, change) VALUES (?, ?, ?)', now, actor, change.slice(0, 500));
@@ -245,16 +254,21 @@ export class Store {
   // ---------------------------------------------------------------- watchlist
 
   watchList(): WatchRow[] {
-    return this.db.all<WatchDbRow>('SELECT symbol, timeframes, origin, status, below_since, updated_at FROM watch ORDER BY symbol').map(toWatch);
+    return this.db.all<WatchDbRow>('SELECT symbol, timeframes, origin, status, below_since, low_since, updated_at FROM watch ORDER BY symbol').map(toWatch);
   }
 
   saveWatch(row: WatchRow): void {
     this.db.run(
-      `INSERT INTO watch (symbol, timeframes, origin, status, below_since, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO watch (symbol, timeframes, origin, status, below_since, low_since, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(symbol) DO UPDATE SET timeframes = excluded.timeframes, origin = excluded.origin, status = excluded.status,
-         below_since = excluded.below_since, updated_at = excluded.updated_at`,
-      row.symbol, row.timeframes.join(','), row.origin, row.status, row.belowSince, row.updatedAt
+         below_since = excluded.below_since, low_since = excluded.low_since, updated_at = excluded.updated_at`,
+      row.symbol, row.timeframes.join(','), row.origin, row.status, row.belowSince, row.lowVolumeSince, row.updatedAt
     );
+  }
+
+  /** Forgets a coin entirely (Removal: Auto), so it can join again by itself like any new coin. */
+  deleteWatch(symbol: string): void {
+    this.db.run('DELETE FROM watch WHERE symbol = ?', symbol);
   }
 
   // ---------------------------------------------------------------- signal state
@@ -421,7 +435,7 @@ export class Store {
   // ---------------------------------------------------------------- portability and housekeeping
 
   exportState(): PortableState {
-    return { settings: this.settings(), watch: this.watchList() };
+    return { settings: storedSettings(this.settings()), watch: this.watchList() };
   }
 
   /** Replaces settings and the watchlist with a copy from the other runtime. Signal state is kept (it is recomputed anyway). */
@@ -436,7 +450,7 @@ export class Store {
         if (typeof w?.symbol !== 'string' || !/^[A-Z0-9_.-]{1,40}$/.test(w.symbol)) continue;
         const tfs = Array.isArray(w.timeframes) ? w.timeframes.filter(isTimeframe) : [];
         const status: WatchStatus = w.status === 'paused' || w.status === 'removed' ? w.status : 'active';
-        this.saveWatch({ symbol: w.symbol, timeframes: status === 'removed' ? [] : tfs, origin: w.origin === 'user' ? 'user' : 'auto', status: tfs.length || status === 'removed' ? status : 'removed', belowSince: typeof w.belowSince === 'number' ? w.belowSince : null, updatedAt: now });
+        this.saveWatch({ symbol: w.symbol, timeframes: status === 'removed' ? [] : tfs, origin: w.origin === 'user' ? 'user' : 'auto', status: tfs.length || status === 'removed' ? status : 'removed', belowSince: typeof w.belowSince === 'number' ? w.belowSince : null, lowVolumeSince: typeof w.lowVolumeSince === 'number' ? w.lowVolumeSince : null, updatedAt: now });
       }
     });
     return { ok: true };

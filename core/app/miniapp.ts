@@ -1,7 +1,7 @@
 // The coin picker, a Telegram mini app served at /app (S5). It lists coins above the volume filter plus the
 // watchlist, with a search bar and per-coin timeframe ticks. Each tap saves at once; the server checks the user's
 // Telegram signature, the volume filter and the 16-coin cap. Colours follow the user's Telegram theme.
-import { TIMEFRAMES } from '../config/settings.ts';
+import { SYSTEM, TIMEFRAMES } from '../config/settings.ts';
 
 export const MINI_APP_CSP = [
   "default-src 'none'",
@@ -53,7 +53,7 @@ export const MINI_APP_HTML = `<!doctype html>
   .stats { margin-left: auto; text-align: right; font-size: 12px; color: var(--hint); white-space: nowrap; }
   .pos { color: var(--up); } .neg { color: var(--down); }
   .tfs { display: grid; grid-template-columns: repeat(${TIMEFRAMES.length}, 1fr); gap: 6px; margin-top: 8px; }
-  .tf { min-width: 0; min-height: 40px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
+  .tf { min-width: 0; padding: 0; min-height: 40px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 14px; font-weight: 600; }
   .tf.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
   .tf:disabled { opacity: .5; }
   .actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
@@ -88,6 +88,7 @@ export const MINI_APP_HTML = `<!doctype html>
 export const MINI_APP_JS = String.raw`(function () {
   'use strict';
   var TFS = ${JSON.stringify(TIMEFRAMES)};
+  var CHECK_MINUTES = ${SYSTEM.coins.universeRefreshMinutes};
   var tg = window.Telegram && window.Telegram.WebApp;
   var initData = tg ? tg.initData : '';
   var state = { coins: [], meta: null, query: '', filter: 'all', busy: {} };
@@ -101,6 +102,12 @@ export const MINI_APP_JS = String.raw`(function () {
     if (n >= 1e9) return '$' + (n / 1e9).toFixed(1) + 'B';
     if (n >= 1e6) return '$' + (n >= 1e8 ? Math.round(n / 1e6) : (n / 1e6).toFixed(1)) + 'M';
     return '$' + Math.round(n / 1e3) + 'K';
+  }
+  /** "in about 2 h 10 min", or "at the next check" once due (the watchlist is checked every CHECK_MINUTES). */
+  function leftText(at) {
+    var min = Math.ceil((at - Date.now()) / 60000);
+    if (min <= 0) return 'at the next check (within ' + CHECK_MINUTES + ' min)';
+    return 'in about ' + (min >= 60 ? Math.floor(min / 60) + ' h ' : '') + (min % 60) + ' min';
   }
   function toast(text, bad) {
     toastEl.textContent = text;
@@ -196,6 +203,7 @@ export const MINI_APP_JS = String.raw`(function () {
       card.appendChild(actions);
       if (c.status === 'paused') card.appendChild(el('div', 'note', 'Delta is not trading this coin right now: alerts resume on these timeframes when trading restarts.'));
       if (c.status === 'removed') card.appendChild(el('div', 'note', 'You removed this coin. Tick a timeframe to add it back.'));
+      if (typeof c.autoRemoveAt === 'number') card.appendChild(el('div', 'note', 'Below your volume filter. Removal is Auto: it goes ' + leftText(c.autoRemoveAt) + ' unless its volume recovers.'));
       list.appendChild(card);
     });
   }
