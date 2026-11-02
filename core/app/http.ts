@@ -10,6 +10,7 @@
 import { safeEqual, syncKey, validateInitData, webhookSecret } from './auth.ts';
 import type { Engine } from './engine.ts';
 import { MINI_APP_CSP, MINI_APP_HTML, MINI_APP_JS } from './miniapp.ts';
+import { OPEN_APP_CSP, OPEN_APP_JS, deltaOpenPage } from './openapp.ts';
 import type { TelegramUpdate } from '../notify/telegram.ts';
 import type { PortableState } from '../store/store.ts';
 import { SYSTEM } from '../config/settings.ts';
@@ -43,6 +44,11 @@ export async function handleHttp(request: Request, engine: Engine): Promise<Resp
     if (path === '/app' && method === 'GET') return new Response(MINI_APP_HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': MINI_APP_CSP, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' } });
     if (path === '/app.js' && method === 'GET') return new Response(MINI_APP_JS, { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' } });
     if (path === '/api/coins' && (method === 'GET' || method === 'POST')) return await coins(request, engine);
+    if (path.startsWith('/open/delta/') && method === 'GET') {
+      const page = deltaOpenPage(path.slice('/open/delta/'.length)); // symbols are A-Z and 0-9 only; anything else is 404
+      return page ? new Response(page, { headers: { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': OPEN_APP_CSP, 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' } }) : text('Not found', 404);
+    }
+    if (path === '/open.js' && method === 'GET') return new Response(OPEN_APP_JS, { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' } });
     if (path.startsWith('/api/sync/') && engine.host.runtime === 'Cloudflare') return await sync(request, engine, path, method);
     if (path === '/') return text('EMA Tracker v2. Open Telegram and send /start.', 200);
     return text('Not found', 404);

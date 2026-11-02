@@ -23,6 +23,8 @@ export interface DeliverOptions {
   timeZone: string;
   /** Maximum Telegram calls in this run (Cloudflare's per-run outbound call budget). */
   maxSends: number;
+  /** Public address of the Cloudflare bot, used for the "open in the Delta app" link in alerts. */
+  linkBase?: string | null;
 }
 
 export interface DeliveryReport {
@@ -167,7 +169,7 @@ export async function deliver(o: DeliverOptions): Promise<DeliveryReport> {
     } else {
       for (const a of alerts) {
         const lateMs = now - a.row.eventAt;
-        const r = await sendText(renderAlert(a.row.id, a.payload, { timeZone: o.timeZone, lateMs }));
+        const r = await sendText(renderAlert(a.row.id, a.payload, { timeZone: o.timeZone, lateMs, linkBase: o.linkBase }));
         if (!r) return report;
         if (!r.ok) {
           if (onFailure(r.error, [a.row])) return report;
