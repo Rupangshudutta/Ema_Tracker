@@ -146,7 +146,7 @@ describe('HTTP routes', () => {
     assert.ok(script.includes('tg.openLink(url)'), 'chart buttons open outside Telegram');
     const btc = (body.coins as unknown as { symbol: string; chartUrl: string; deltaUrl: string }[]).find(c => c.symbol === 'BTCUSD')!;
     assert.equal(btc.chartUrl, 'https://www.tradingview.com/chart/?symbol=DELTAIN%3ABTCUSD.P&interval=15');
-    assert.equal(btc.deltaUrl, `${BASE}/open/delta/BTCUSD`, 'the Delta button goes through the open-in-app page');
+    assert.equal(btc.deltaUrl, 'https://deltaexchange.onelink.me/DIpL?af_web_dp=https%3A%2F%2Fwww.delta.exchange%2Fapp%2Ffutures%2Ftrade%2FBTC%2FBTCUSD', 'the Delta app button uses the app link');
     const fast = await handleHttp(new Request(`${BASE}/api/coins`, { method: 'POST', headers, body: JSON.stringify({ symbol: 'ETHUSD', timeframes: ['1m', '3m'] }) }), engine);
     assert.equal(fast.status, 200);
   });

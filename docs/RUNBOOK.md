@@ -39,7 +39,9 @@ Address: https://ema-tracker.rupangshudutta.workers.dev (health page: `/health`)
 | Mute alerts for a while | `/pause 2h` or `/start` → Pause; `/resume` to undo |
 | See the market | `/start` → 📈 Top gainers, 📉 Top losers, 💰 Highest volume (24 h, top 10), or `/top`. Gainers and losers skip coins under $1M volume; 👁 marks coins on your watchlist |
 
-Every alert has a **chart** link that opens TradingView on the alert's own timeframe (Delta India perpetual, for example `DELTAIN:BTCUSD.P` on 5m for a 5m alert) and a **Delta** link to the coin's page on Delta Exchange India. In the coin picker every coin has **📈 TradingView 15m** and **Delta** buttons; they open outside Telegram, so on a phone the browser or the TradingView / Delta app opens on that coin. Delta's own chart opens on the timeframe you last picked in Delta (a link cannot choose it), so pick 15m there once.
+Every alert has a **chart** link that opens TradingView on the alert's own timeframe (Delta India perpetual, for example `DELTAIN:BTCUSD.P` on 5m for a 5m alert) and a **Delta app** link. In the coin picker every coin has **📈 TradingView 15m** and **Delta app** buttons.
+
+The **Delta app** link is Delta's own app link (`deltaexchange.onelink.me`). On your Android phone it opens the Delta app on its home screen, where you search for the coin: Delta offers no link that opens a coin inside the app. Without the app it opens the Play Store; on a computer it opens the coin's page on the Delta website. If it opens a browser or the Play Store instead of the app, turn off Telegram's in-app browser (Telegram → Settings → Chat Settings → In-App Browser), or tap **Open** on the Play Store page. The link belongs to Delta's marketing service (AppsFlyer), so each tap counts as a click there; nothing but the coin's page address is added to it. Delta's chart opens on the timeframe you last picked in Delta (a link cannot choose it), so pick 15m there once.
 
 ## Start and stop messages
 

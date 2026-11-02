@@ -159,6 +159,6 @@ describe('daily report on a first start', () => {
 describe('alert text', () => {
   it('links the TradingView chart for the Delta India perpetual', () => {
     const text = renderAlert('id1', { type: 'realtime', symbol: 'BTCUSD', timeframe: '15m', direction: 'up', candleStart: START, price: 1, spreadPct: 0.1, marginPct: 0.05, ctx: null }, { timeZone: 'Asia/Kolkata', lateMs: 0 });
-    assert.match(text, /<a href="https:\/\/www\.tradingview\.com\/chart\/\?symbol=DELTAIN%3ABTCUSD\.P&amp;interval=15">chart 15m<\/a> · <a href="https:\/\/www\.delta\.exchange\/app\/futures\/trade\/BTC\/BTCUSD">Delta<\/a>/);
+    assert.match(text, /<a href="https:\/\/www\.tradingview\.com\/chart\/\?symbol=DELTAIN%3ABTCUSD\.P&amp;interval=15">chart 15m<\/a> · <a href="https:\/\/deltaexchange\.onelink\.me\/DIpL\?af_web_dp=https%3A%2F%2Fwww\.delta\.exchange%2Fapp%2Ffutures%2Ftrade%2FBTC%2FBTCUSD">Delta app<\/a>/);
   });
 });

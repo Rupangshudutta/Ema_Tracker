@@ -21,8 +21,7 @@ import { syncKey, webhookSecret } from './auth.ts';
 import { handleUpdate } from './bot.ts';
 import { Feed, type FeedOpener, type FeedStatus } from './feed.ts';
 import { fmtUsd, notes, renderDailyReport, type AlertPayload, type StartKind, type TickerContext, type TopListKind } from './messages.ts';
-import { tradingViewUrl } from './links.ts';
-import { deltaLinkFor } from './openapp.ts';
+import { deltaAppUrl, tradingViewUrl } from './links.ts';
 import { deliver } from './outbox.ts';
 import { applyUniverse, editCoin, qualifies } from './watchlist.ts';
 
@@ -237,11 +236,6 @@ export class Engine {
 
   currentRole(): Role {
     return this.role;
-  }
-
-  /** Address of the "open in the Delta app" page: only Cloudflare serves it; Docker links go to the website. */
-  private openPageBase(): string | null {
-    return this.host.runtime === 'Cloudflare' ? (this.env?.publicBaseUrl ?? null) : null;
   }
 
   /** Public, non-secret ID of this notebook (shown on /health). */
@@ -811,7 +805,7 @@ export class Engine {
     const out = new Map<string, CoinInfo>();
     for (const t of this.universe.values()) {
       if (!qualifies(t, s)) continue;
-      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true, autoRemoveAt: null, chartUrl: tradingViewUrl(t.symbol), deltaUrl: deltaLinkFor(this.openPageBase(), t.symbol, t.underlying) });
+      out.set(t.symbol, { symbol: t.symbol, turnoverUsd24h: t.turnoverUsd24h, change24hPct: t.change24hPct, lastPrice: t.lastPrice, status: 'available', timeframes: [], qualifies: true, autoRemoveAt: null, chartUrl: tradingViewUrl(t.symbol), deltaUrl: deltaAppUrl(t.symbol, t.underlying) });
     }
     for (const w of this.watch) {
       const t = this.universe.get(w.symbol);
@@ -827,7 +821,7 @@ export class Engine {
         qualifies: ok,
         autoRemoveAt: s.coins.removal === 'auto' && w.status === 'active' && !ok && w.lowVolumeSince !== null ? w.lowVolumeSince + AUTO_REMOVE_MS : null,
         chartUrl: tradingViewUrl(w.symbol),
-        deltaUrl: deltaLinkFor(this.openPageBase(), w.symbol, t?.underlying)
+        deltaUrl: deltaAppUrl(w.symbol, t?.underlying)
       });
     }
     return [...out.values()].sort((a, b) => (b.turnoverUsd24h ?? 0) - (a.turnoverUsd24h ?? 0));
@@ -1129,7 +1123,6 @@ export class Engine {
         chatId: this.env.telegramChatId,
         now,
         timeZone: this.store.settings().monitoring.timeZone,
-        linkBase: this.openPageBase(),
         maxSends: Math.max(0, budget.remaining() - 2)
       });
       if (r.error) this.telegramFailure(r.error, now);

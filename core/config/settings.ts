@@ -70,6 +70,14 @@ export const SYSTEM = {
     tradingViewChart: 'https://www.tradingview.com/chart/',
     /** Delta Exchange India trade page: <base>/<underlying>/<symbol> (india.delta.exchange redirects here). */
     deltaTrade: 'https://www.delta.exchange/app/futures/trade',
+    /**
+     * Delta's own app link (AppsFlyer OneLink, template DIpL, from Delta's marketing posts). Its assetlinks.json names
+     * the Delta India Android app (com.deltaexchangeindia), so Android should open the installed app straight from it
+     * (assetlinks.json checked 2026-11-02, on-phone test pending; delta.exchange itself declares no app links).
+     * Alerts use it directly rather than through a redirect of ours: Android only hands a link to an app when the
+     * tapped link itself belongs to the app.
+     */
+    deltaAppLink: 'https://deltaexchange.onelink.me/DIpL',
     /** Timeframe charts open on when no alert timeframe applies (the coin picker). */
     defaultChartTimeframe: '15m' as Timeframe
   },

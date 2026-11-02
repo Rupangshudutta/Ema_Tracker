@@ -91,6 +91,7 @@ When work happens.
 | --- | --- | --- | --- | --- | --- |
 | `tradingViewChart` | TradingView chart address; Delta India perpetuals are `DELTAIN:<symbol>.P` | https://www.tradingview.com/chart/ | Fixed | Config file in git | Nobody |
 | `deltaTrade` | Delta Exchange India trade page, as `<address>/<coin>/<symbol>` | https://www.delta.exchange/app/futures/trade | Fixed | Config file in git | Nobody |
+| `deltaAppLink` | Delta's own app link (AppsFlyer OneLink) behind the **Delta app** links: opens the Delta Android app; computers get the coin's trade page | https://deltaexchange.onelink.me/DIpL | Fixed | Config file in git | Nobody |
 | `defaultChartTimeframe` | Timeframe the coin picker's TradingView button opens on (alerts use their own timeframe) | 15m | Any timeframe | Config file in git | Nobody |
 
 ## Market lists

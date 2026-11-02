@@ -191,7 +191,7 @@ export const MINI_APP_JS = String.raw`(function () {
       var actions = el('div', 'actions');
       var links = el('div', 'links');
       links.appendChild(linkButton('📈 TradingView 15m', c.chartUrl));
-      links.appendChild(linkButton('Delta', c.deltaUrl));
+      links.appendChild(linkButton('Delta app', c.deltaUrl));
       actions.appendChild(links);
       if (c.status === 'active' || c.status === 'paused') {
         var rm = el('button', 'remove', 'Remove');

@@ -1,6 +1,6 @@
-// Links that open a coin's chart: TradingView (on a chosen timeframe) and Delta Exchange India's own trade page.
-// Both are plain https links, so on a phone they open in the browser, or in the TradingView or Delta app when the app
-// takes over those links.
+// Links that open a coin: TradingView's chart (on a chosen timeframe), Delta Exchange India's trade page, and Delta's
+// app link. All are plain https links, so on a phone they open in the browser, or in the TradingView or Delta app when
+// the app takes over those links.
 import { SYSTEM, type Timeframe } from '../config/settings.ts';
 
 /** TradingView's interval codes for our timeframes (minutes). */
@@ -21,4 +21,13 @@ export function tradingViewUrl(symbol: string, timeframe: Timeframe = SYSTEM.lin
 export function deltaUrl(symbol: string, underlying?: string | null): string {
   const base = underlying || symbol.replace(/USD$/, '');
   return `${SYSTEM.links.deltaTrade}/${encodeURIComponent(base)}/${encodeURIComponent(symbol)}`;
+}
+
+/**
+ * The "Delta app" link in alerts and the coin picker: Delta's own app link. On Android with the Delta app installed
+ * the app should open (on its home screen: Delta documents no way to open a coin in the app); without the app, or
+ * when the tap stays inside Telegram's in-app browser, the Play Store opens. A computer goes to the coin's trade page (af_web_dp), an iPhone to Delta's App Store page.
+ */
+export function deltaAppUrl(symbol: string, underlying?: string | null): string {
+  return `${SYSTEM.links.deltaAppLink}?${new URLSearchParams({ af_web_dp: deltaUrl(symbol, underlying) }).toString()}`;
 }
